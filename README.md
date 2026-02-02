@@ -1,10 +1,12 @@
 # File Distribution System
 
-Distribute large files (e.g., ML model weights) across server fleets efficiently.
+Mini MVP for a system to distribute large files (e.g., ML model weights) across server fleets efficiently via P2P transfers.
+Architecture is more detailed under [](/docs).
 
 ## Implementations
 
 ### Pipeline (Chain Topology)
+
 Servers form a chain where each downloads from its predecessor. Simple, predictable.
 
 ```bash
@@ -15,7 +17,8 @@ cargo build --release
 ```
 
 ### Mesh (P2P Topology)
-Dynamic shard distribution using rarest-first scheduling. More parallel, faster for large fleets.
+
+Dynamic shard distribution using rarest-first scheduling. Better for dealing with random slow servers (mesh scheduler will implicitly route around them - assign less frequently peers to them.)
 
 ```bash
 cd mesh
