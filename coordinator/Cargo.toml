@@ -1,0 +1,23 @@
+[package]
+name = "coordinator"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+axum = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "chrono", "uuid"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+reqwest = { workspace = true }
+urlencoding = { workspace = true }
+object_store = { version = "0.11", features = ["gcp"] }
+dotenvy = "0.15"

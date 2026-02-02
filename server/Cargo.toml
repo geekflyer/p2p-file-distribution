@@ -1,0 +1,27 @@
+[package]
+name = "server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+common = { path = "../common" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+tonic = "0.12"
+reqwest = { version = "0.12", features = ["json"] }
+sha2 = "0.10"
+object_store = { version = "0.11", features = ["gcp"] }
+tokio-stream = "0.1"
+hex = "0.4"
+urlencoding = "2"
+libc = "0.2"
+crc32c = "0.6"
+dotenvy = "0.15"
+futures = "0.3"
