@@ -7,7 +7,7 @@ Architecture is more detailed under [](/docs).
 
 ### Pipeline (Chain Topology)
 
-Servers form a chain where each downloads from its predecessor. Simple, predictable.
+Servers form a chain where each downloads from its predecessor. Simple, predictable. But random slow workers slow other peers progress equally.
 
 ```bash
 cd pipeline
@@ -18,7 +18,7 @@ cargo build --release
 
 ### Mesh (P2P Topology)
 
-Dynamic shard distribution using rarest-first scheduling. Better for dealing with random slow servers (mesh scheduler will implicitly route around them - assign less frequently peers to them.)
+Dynamic shard distribution using rarest-first scheduling. Better for dealing with random slow servers (mesh scheduler will implicitly route around them - assign less frequently peers to them.). Scheduler has high lock contention at large N workers (1000++).
 
 ```bash
 cd mesh
