@@ -57,6 +57,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/admin/servers", get(api::list_servers))
         .route("/admin/jobs", get(api::list_jobs).post(api::create_job))
         .route("/admin/jobs/{id}", get(api::get_job_details))
+        .route("/admin/jobs/cancel/{id}", post(api::cancel_job))
+        .route("/admin/jobs/purge/{id}", post(api::purge_job))
         // Server API
         .route(
             "/server/model-deployment-tasks",

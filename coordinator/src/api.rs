@@ -5,8 +5,8 @@ use axum::{
     response::IntoResponse,
 };
 use common::{
-    CreateJobRequest, CreateJobResponse, GcsManifest, HeartbeatRequest, JobDetails, TaskProgress,
-    UpstreamAssignment, UpstreamType,
+    CreateJobRequest, CreateJobResponse, GcsManifest, HeartbeatRequest, HeartbeatResponse,
+    JobDetails, TaskProgress, UpstreamAssignment, UpstreamType,
 };
 use object_store::ObjectStore;
 use object_store::gcp::GoogleCloudStorageBuilder;
@@ -143,7 +143,10 @@ pub async fn heartbeat(
         }
     }
 
-    StatusCode::OK.into_response()
+    // Return list of purged jobs for cleanup
+    let purge_job_ids = db::get_purged_job_ids(&state.pool).await.unwrap_or_default();
+
+    Json(HeartbeatResponse { purge_job_ids }).into_response()
 }
 
 // ============ Admin API Handlers ============
@@ -214,9 +217,17 @@ async fn fetch_manifest(_state: &AppState, gcs_path: &str) -> anyhow::Result<Gcs
     let object = &path[slash_pos + 1..];
 
     // Build store
-    // - GCS_SERVICE_ACCOUNT_PATH: For testing with custom endpoint (gcs_base_url/disable_oauth)
+    // - STORAGE_EMULATOR_HOST: For local testing with fake-gcs-server
+    // - GCS_SERVICE_ACCOUNT_PATH: For testing with real GCS using service account
     // - Otherwise: Use ADC (Application Default Credentials) for production
-    let store = if let Ok(creds_path) = std::env::var("GCS_SERVICE_ACCOUNT_PATH") {
+    let store = if let Ok(emulator_url) = std::env::var("STORAGE_EMULATOR_HOST") {
+        // For fake-gcs-server: use HTTP endpoint directly
+        let url = format!("{}/storage/v1/b/{}/o/{}?alt=media",
+            emulator_url, bucket, urlencoding::encode(object));
+        let data = reqwest::get(&url).await?.bytes().await?.to_vec();
+        let manifest: GcsManifest = serde_json::from_slice(&data)?;
+        return Ok(manifest);
+    } else if let Ok(creds_path) = std::env::var("GCS_SERVICE_ACCOUNT_PATH") {
         GoogleCloudStorageBuilder::new()
             .with_bucket_name(bucket)
             .with_service_account_path(creds_path)
@@ -301,4 +312,46 @@ pub async fn get_job_details(
         server_progress,
     })
     .into_response()
+}
+
+/// POST /admin/jobs/{id}/cancel
+/// Cancel a running job (stops servers from working on it)
+pub async fn cancel_job(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match db::cancel_job(&state.pool, job_id).await {
+        Ok(true) => {
+            tracing::info!("Job {} cancelled", job_id);
+            StatusCode::OK.into_response()
+        }
+        Ok(false) => {
+            (StatusCode::BAD_REQUEST, "Job not found or not in created/in_progress state").into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to cancel job: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+/// POST /admin/jobs/{id}/purge
+/// Purge a completed, failed, or cancelled job (marks for data deletion on servers)
+pub async fn purge_job(
+    State(state): State<Arc<AppState>>,
+    Path(job_id): Path<Uuid>,
+) -> impl IntoResponse {
+    match db::purge_job(&state.pool, job_id).await {
+        Ok(true) => {
+            tracing::info!("Job {} marked as purged", job_id);
+            StatusCode::OK.into_response()
+        }
+        Ok(false) => {
+            (StatusCode::BAD_REQUEST, "Job not found or not in completed/failed state").into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to purge job: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
 }

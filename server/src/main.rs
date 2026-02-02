@@ -102,6 +102,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn heartbeat task
     let heartbeat_states = task_states.clone();
+    let heartbeat_storage = storage.clone();
     let heartbeat_coordinator = CoordinatorClient::new(
         std::env::var("COORDINATOR_URL").unwrap_or_else(|_| "http://localhost:8080".to_string()),
         server_addr.clone(),
@@ -125,8 +126,24 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             drop(states);
 
-            if let Err(e) = heartbeat_coordinator.heartbeat(progress).await {
-                tracing::warn!("Failed to send heartbeat: {}", e);
+            match heartbeat_coordinator.heartbeat(progress).await {
+                Ok(response) => {
+                    // Handle purge requests
+                    for job_id in response.purge_job_ids {
+                        // Remove from task states
+                        {
+                            let mut states = heartbeat_states.write().await;
+                            states.remove(&job_id);
+                        }
+                        // Delete data from storage
+                        if let Err(e) = heartbeat_storage.delete_job(job_id).await {
+                            tracing::warn!("Failed to delete data for purged job {}: {}", job_id, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to send heartbeat: {}", e);
+                }
             }
         }
     });
@@ -217,6 +234,15 @@ async fn main() -> anyhow::Result<()> {
                 None
             };
 
+            // Fetch manifest to get shard paths
+            let manifest = match downloader.fetch_manifest(&task.gcs_manifest_path).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("Failed to fetch manifest for job {}: {} - will retry", job_id, e);
+                    continue;
+                }
+            };
+
             // Download shards
             for shard_id in start_from_shard..task.total_shards {
                 // Update current shard being worked on
@@ -230,7 +256,6 @@ async fn main() -> anyhow::Result<()> {
 
                 // Progress callback for bytes within this shard
                 let task_states_clone = task_states.clone();
-                let shard_size = task.shard_size;
                 let progress_callback = move |bytes_downloaded: u64, total_bytes: u64, throughput_bps: Option<u64>| {
                     let states = task_states_clone.clone();
                     async move {
@@ -248,6 +273,16 @@ async fn main() -> anyhow::Result<()> {
                     }
                 };
 
+                // Get shard info from manifest
+                let shard_info = manifest.shards.get(shard_id as usize);
+                let shard_path = shard_info
+                    .map(|s| s.path.as_str())
+                    .unwrap_or_else(|| {
+                        tracing::warn!("Shard {} not found in manifest, using default path", shard_id);
+                        ""
+                    });
+                let shard_size = shard_info.map(|s| s.size).unwrap_or(task.shard_size);
+
                 // Download the shard
                 let result = match upstream.upstream_type {
                     UpstreamType::Gcs => {
@@ -255,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
                             .download_shard_from_gcs(
                                 job_id,
                                 &task.gcs_file_path,
+                                shard_path,
                                 shard_id,
                                 shard_size,
                                 progress_callback,

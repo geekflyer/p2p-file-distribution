@@ -1,4 +1,4 @@
-use common::{DeploymentTask, HeartbeatRequest, TaskProgress, UpstreamAssignment};
+use common::{DeploymentTask, HeartbeatRequest, HeartbeatResponse, TaskProgress, UpstreamAssignment};
 use reqwest::Client;
 use uuid::Uuid;
 
@@ -57,8 +57,8 @@ impl CoordinatorClient {
         Ok(assignment)
     }
 
-    /// Send heartbeat with task progress
-    pub async fn heartbeat(&self, task_progress: Vec<TaskProgress>) -> anyhow::Result<()> {
+    /// Send heartbeat with task progress, returns jobs to purge
+    pub async fn heartbeat(&self, task_progress: Vec<TaskProgress>) -> anyhow::Result<HeartbeatResponse> {
         let url = format!("{}/server/heartbeat", self.base_url);
 
         let request = HeartbeatRequest {
@@ -72,7 +72,8 @@ impl CoordinatorClient {
             anyhow::bail!("Failed to send heartbeat: {}", response.status());
         }
 
-        Ok(())
+        let heartbeat_response: HeartbeatResponse = response.json().await?;
+        Ok(heartbeat_response)
     }
 
     #[allow(dead_code)]

@@ -362,6 +362,7 @@ pub async fn update_task_progress(
 ) -> Result<(), sqlx::Error> {
     let status = if completed { "completed" } else { "in_progress" };
 
+    // Only update tasks that are not in a terminal state (cancelled)
     sqlx::query(
         r#"
         UPDATE server_model_deployment_tasks
@@ -372,6 +373,7 @@ pub async fn update_task_progress(
             throughput_bps = $5,
             updated_at = datetime('now')
         WHERE server_address = $6 AND deployment_job_id = $7
+          AND status NOT IN ('cancelled')
         "#,
     )
     .bind(last_shard_id_completed)
@@ -388,7 +390,7 @@ pub async fn update_task_progress(
     if completed {
         update_job_status_if_complete(pool, job_id).await?;
     } else {
-        // Mark job as in_progress if it's still in created state
+        // Mark job as in_progress if it's still in created state (not cancelled/purged)
         sqlx::query(
             r#"
             UPDATE model_deployment_jobs
@@ -417,11 +419,12 @@ async fn update_job_status_if_complete(pool: &DbPool, job_id: Uuid) -> Result<()
     .await?;
 
     if incomplete_count == 0 {
+        // Only transition to completed if not already in a terminal state
         sqlx::query(
             r#"
             UPDATE model_deployment_jobs
             SET status = 'completed', updated_at = datetime('now')
-            WHERE deployment_job_id = $1
+            WHERE deployment_job_id = $1 AND status IN ('created', 'in_progress')
             "#,
         )
         .bind(job_id.to_string())
@@ -430,6 +433,69 @@ async fn update_job_status_if_complete(pool: &DbPool, job_id: Uuid) -> Result<()
     }
 
     Ok(())
+}
+
+/// Cancel a job (stops servers from working on it)
+pub async fn cancel_job(pool: &DbPool, job_id: Uuid) -> Result<bool, sqlx::Error> {
+    // Only cancel jobs that are in progress or created
+    let result = sqlx::query(
+        r#"
+        UPDATE model_deployment_jobs
+        SET status = 'cancelled', updated_at = datetime('now')
+        WHERE deployment_job_id = $1 AND status IN ('created', 'in_progress')
+        "#,
+    )
+    .bind(job_id.to_string())
+    .execute(pool)
+    .await?;
+
+    if result.rows_affected() > 0 {
+        // Also cancel all associated tasks
+        sqlx::query(
+            r#"
+            UPDATE server_model_deployment_tasks
+            SET status = 'cancelled', updated_at = datetime('now')
+            WHERE deployment_job_id = $1 AND status != 'completed'
+            "#,
+        )
+        .bind(job_id.to_string())
+        .execute(pool)
+        .await?;
+
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+/// Purge a job (mark as purged, servers will delete data)
+pub async fn purge_job(pool: &DbPool, job_id: Uuid) -> Result<bool, sqlx::Error> {
+    let result = sqlx::query(
+        r#"
+        UPDATE model_deployment_jobs
+        SET status = 'purged', updated_at = datetime('now')
+        WHERE deployment_job_id = $1 AND status IN ('completed', 'failed', 'cancelled')
+        "#,
+    )
+    .bind(job_id.to_string())
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Get all purged job IDs (for servers to clean up)
+pub async fn get_purged_job_ids(pool: &DbPool) -> Result<Vec<Uuid>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String,)>(
+        "SELECT deployment_job_id FROM model_deployment_jobs WHERE status = 'purged'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id,)| Uuid::parse_str(&id).ok())
+        .collect())
 }
 
 /// Parse datetime from SQLite format

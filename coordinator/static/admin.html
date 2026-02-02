@@ -25,6 +25,11 @@
         .status.unhealthy, .status.failed { background: #f8d7da; color: #721c24; }
         .status.created { background: #e2e3e5; color: #383d41; }
         .status.in_progress { background: #cce5ff; color: #004085; }
+        .status.purged { background: #f5f5f5; color: #6c757d; }
+        .status.cancelled { background: #fff3cd; color: #856404; }
+        .btn-danger { background: #dc3545; margin-left: 5px; }
+        .btn-danger:hover { background: #c82333; }
+        .btn-small { padding: 5px 10px; font-size: 12px; }
         .progress-bar { width: 100%; height: 20px; background: #e9ecef; border-radius: 4px; overflow: hidden; }
         .progress-fill { height: 100%; background: #28a745; transition: width 0.3s; }
         .refresh-btn { background: #6c757d; margin-left: 10px; }
@@ -201,6 +206,8 @@
                 const tbody = document.querySelector('#jobsTable tbody');
                 tbody.innerHTML = jobs.map(j => {
                     const isSelected = j.deploymentJobId === currentJobId;
+                    const canCancel = j.status === 'created' || j.status === 'in_progress';
+                    const canPurge = j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled';
                     return `
                         <tr style="${isSelected ? 'background: #e3f2fd;' : ''}">
                             <td>${j.deploymentJobId.substring(0, 8)}...</td>
@@ -209,7 +216,11 @@
                             <td>${j.totalShards}</td>
                             <td><span class="status ${j.status}">${j.status}</span></td>
                             <td>${new Date(j.createdAt).toLocaleString()}</td>
-                            <td><button onclick="viewJobDetails('${j.deploymentJobId}')">${isSelected ? 'Viewing' : 'View'}</button></td>
+                            <td>
+                                <button class="btn-small" onclick="viewJobDetails('${j.deploymentJobId}')">${isSelected ? 'Viewing' : 'View'}</button>
+                                ${canCancel ? `<button class="btn-small btn-danger" onclick="cancelJob('${j.deploymentJobId}')">Cancel</button>` : ''}
+                                ${canPurge ? `<button class="btn-small btn-danger" onclick="purgeJob('${j.deploymentJobId}')">Purge</button>` : ''}
+                            </td>
                         </tr>
                     `;
                 }).join('');
@@ -228,6 +239,46 @@
 
             await refreshJobDetails();
             fetchJobs(); // Refresh to show selection
+        }
+
+        async function cancelJob(jobId) {
+            if (!confirm('Are you sure you want to cancel this job? Servers will stop downloading.')) {
+                return;
+            }
+
+            try {
+                const res = await fetch(`/admin/jobs/cancel/${jobId}`, { method: 'POST' });
+                if (res.ok) {
+                    fetchJobs();
+                    refreshJobDetails();
+                } else {
+                    alert('Failed to cancel job: ' + await res.text());
+                }
+            } catch (e) {
+                alert('Failed to cancel job: ' + e.message);
+            }
+        }
+
+        async function purgeJob(jobId) {
+            if (!confirm('Are you sure you want to purge this job? This will delete all shard data from servers.')) {
+                return;
+            }
+
+            try {
+                const res = await fetch(`/admin/jobs/purge/${jobId}`, { method: 'POST' });
+                if (res.ok) {
+                    // Clear selection if we purged the current job
+                    if (currentJobId === jobId) {
+                        currentJobId = null;
+                        document.getElementById('jobDetailsCard').style.display = 'none';
+                    }
+                    fetchJobs();
+                } else {
+                    alert('Failed to purge job: ' + await res.text());
+                }
+            } catch (e) {
+                alert('Failed to purge job: ' + e.message);
+            }
         }
 
         async function refreshJobDetails() {

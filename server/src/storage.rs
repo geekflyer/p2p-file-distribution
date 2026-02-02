@@ -141,6 +141,16 @@ impl ShardStorage {
 
         max_complete_shard
     }
+
+    /// Delete all data for a job (used when job is purged)
+    pub async fn delete_job(&self, job_id: Uuid) -> anyhow::Result<()> {
+        let dir = self.job_dir(job_id);
+        if dir.exists() {
+            fs::remove_dir_all(&dir).await?;
+            tracing::info!("Deleted data for job {}", job_id);
+        }
+        Ok(())
+    }
 }
 
 /// Compute CRC32C checksum of data (hardware accelerated on modern CPUs)

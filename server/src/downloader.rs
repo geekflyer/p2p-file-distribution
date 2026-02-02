@@ -1,5 +1,6 @@
 use common::proto::file_transfer_client::FileTransferClient;
 use common::proto::ShardRequest;
+use common::GcsManifest;
 use futures::StreamExt;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
@@ -55,7 +56,7 @@ impl Downloader {
         })
     }
 
-    /// Get or create an ObjectStore for a bucket
+    /// Get or create an ObjectStore for a bucket (production GCS only)
     async fn get_store(&self, bucket: &str) -> anyhow::Result<Arc<dyn ObjectStore>> {
         // Check cache first
         {
@@ -65,7 +66,7 @@ impl Downloader {
             }
         }
 
-        // Create new store for this bucket
+        // Create new store for this bucket (for production GCS)
         let store = if let Ok(creds_path) = std::env::var("GCS_SERVICE_ACCOUNT_PATH") {
             GoogleCloudStorageBuilder::new()
                 .with_bucket_name(bucket)
@@ -88,6 +89,30 @@ impl Downloader {
         Ok(store)
     }
 
+    /// Fetch manifest from GCS
+    pub async fn fetch_manifest(&self, gcs_manifest_path: &str) -> anyhow::Result<GcsManifest> {
+        // Check for emulator
+        if let Ok(emulator_url) = std::env::var("STORAGE_EMULATOR_HOST") {
+            let (bucket, object) = parse_gcs_path(gcs_manifest_path)?;
+            let url = format!(
+                "{}/storage/v1/b/{}/o/{}?alt=media",
+                emulator_url,
+                bucket,
+                urlencoding::encode(object)
+            );
+            let data = reqwest::get(&url).await?.bytes().await?;
+            let manifest: GcsManifest = serde_json::from_slice(&data)?;
+            return Ok(manifest);
+        }
+
+        let (bucket, object) = parse_gcs_path(gcs_manifest_path)?;
+        let store = self.get_store(bucket).await?;
+        let path = ObjectPath::from(object);
+        let data = store.get(&path).await?.bytes().await?.to_vec();
+        let manifest: GcsManifest = serde_json::from_slice(&data)?;
+        Ok(manifest)
+    }
+
     /// Connect to a peer for P2P transfers
     pub async fn connect_to_peer(peer_addr: &str) -> anyhow::Result<PeerClient> {
         let addr = format!("http://{}", peer_addr);
@@ -100,10 +125,12 @@ impl Downloader {
     }
 
     /// Download a shard from GCS and verify SHA256
+    /// shard_path is relative to gcs_base_path (e.g., "shard_0000.bin")
     pub async fn download_shard_from_gcs<F, Fut>(
         &self,
         job_id: Uuid,
-        gcs_path: &str,
+        gcs_base_path: &str,
+        shard_path: &str,
         shard_id: i32,
         shard_size: u64,
         on_progress: F,
@@ -112,17 +139,10 @@ impl Downloader {
         F: Fn(u64, u64, Option<u64>) -> Fut + Send + Sync,
         Fut: Future<Output = ()> + Send,
     {
-        let (bucket, object_path) = parse_gcs_path(gcs_path)?;
-        let shard_object = format!("{}/shard_{:04}.bin", object_path, shard_id);
+        let (bucket, object_path) = parse_gcs_path(gcs_base_path)?;
+        let shard_object = format!("{}/{}", object_path, shard_path);
 
         tracing::info!("Downloading shard {} from GCS: gs://{}/{}", shard_id, bucket, shard_object);
-
-        let store = self.get_store(bucket).await?;
-        let path = ObjectPath::from(shard_object.as_str());
-
-        // Start streaming download
-        let result = store.get(&path).await?;
-        let mut stream = result.into_stream();
 
         // Start partial file
         self.storage.start_partial_shard(job_id, shard_id).await?;
@@ -132,42 +152,79 @@ impl Downloader {
         let mut throughput_tracker = ThroughputTracker::new();
         let download_start = std::time::Instant::now();
 
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = match chunk_result {
-                Ok(c) => c,
+        // For emulator, use direct HTTP streaming; for production, use object_store
+        if let Ok(emulator_url) = std::env::var("STORAGE_EMULATOR_HOST") {
+            let url = format!(
+                "{}/storage/v1/b/{}/o/{}?alt=media",
+                emulator_url,
+                bucket,
+                urlencoding::encode(&shard_object)
+            );
+            let response = match reqwest::get(&url).await {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) => {
+                    tracing::warn!("GCS emulator error for shard {}: HTTP {} - will retry", shard_id, r.status());
+                    self.storage.abort_partial(job_id, shard_id).await?;
+                    return Ok(false);
+                }
                 Err(e) => {
-                    tracing::warn!("GCS stream error for shard {}: {} - will retry", shard_id, e);
+                    tracing::warn!("GCS emulator error for shard {}: {} - will retry", shard_id, e);
                     self.storage.abort_partial(job_id, shard_id).await?;
                     return Ok(false);
                 }
             };
 
-            // Update SHA256
-            sha256_hasher.update(&chunk);
-
-            // Append to partial file
-            if let Err(e) = self.storage.append_to_partial(job_id, shard_id, &chunk).await {
-                tracing::warn!("Failed to write chunk for shard {}: {} - will retry", shard_id, e);
-                self.storage.abort_partial(job_id, shard_id).await?;
-                return Ok(false);
-            }
-
-            bytes_downloaded += chunk.len() as u64;
-
-            // Apply rate limiting if configured
-            if let Some(rate_bps) = self.gcs_bandwidth_limit_bps {
-                let expected_time = bytes_downloaded as f64 / rate_bps as f64;
-                let actual_time = download_start.elapsed().as_secs_f64();
-                if actual_time < expected_time {
-                    tokio::time::sleep(tokio::time::Duration::from_secs_f64(expected_time - actual_time)).await;
+            // Read body in chunks
+            let body = response.bytes().await?;
+            for chunk in body.chunks(256 * 1024) {
+                sha256_hasher.update(chunk);
+                if let Err(e) = self.storage.append_to_partial(job_id, shard_id, chunk).await {
+                    tracing::warn!("Failed to write chunk for shard {}: {} - will retry", shard_id, e);
+                    self.storage.abort_partial(job_id, shard_id).await?;
+                    return Ok(false);
                 }
+                bytes_downloaded += chunk.len() as u64;
+                throughput_tracker.add_bytes(chunk.len());
+                on_progress(bytes_downloaded, shard_size, throughput_tracker.get_throughput()).await;
             }
+        } else {
+            // Production: use object_store streaming
+            let store = self.get_store(bucket).await?;
+            let path = ObjectPath::from(shard_object.as_str());
+            let result = store.get(&path).await?;
+            let mut stream = result.into_stream();
 
-            // Track throughput
-            throughput_tracker.add_bytes(chunk.len());
+            while let Some(chunk_result) = stream.next().await {
+                let chunk = match chunk_result {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!("GCS stream error for shard {}: {} - will retry", shard_id, e);
+                        self.storage.abort_partial(job_id, shard_id).await?;
+                        return Ok(false);
+                    }
+                };
 
-            // Report progress
-            on_progress(bytes_downloaded, shard_size, throughput_tracker.get_throughput()).await;
+                sha256_hasher.update(&chunk);
+                if let Err(e) = self.storage.append_to_partial(job_id, shard_id, &chunk).await {
+                    tracing::warn!("Failed to write chunk for shard {}: {} - will retry", shard_id, e);
+                    self.storage.abort_partial(job_id, shard_id).await?;
+                    return Ok(false);
+                }
+
+                bytes_downloaded += chunk.len() as u64;
+
+                // Apply rate limiting if configured
+                if let Some(rate_bps) = self.gcs_bandwidth_limit_bps {
+                    let expected_time = bytes_downloaded as f64 / rate_bps as f64;
+                    let actual_time = download_start.elapsed().as_secs_f64();
+                    if actual_time < expected_time {
+                        tokio::time::sleep(tokio::time::Duration::from_secs_f64(expected_time - actual_time)).await;
+                    }
+                }
+
+                throughput_tracker.add_bytes(chunk.len());
+                on_progress(bytes_downloaded, shard_size, throughput_tracker.get_throughput()).await;
+            }
         }
 
         // Verify we got the expected size

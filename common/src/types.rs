@@ -39,6 +39,10 @@ pub enum JobStatus {
     InProgress,
     Completed,
     Failed,
+    /// Job was cancelled by admin
+    Cancelled,
+    /// Job data has been purged from servers (metadata retained)
+    Purged,
 }
 
 impl std::fmt::Display for JobStatus {
@@ -48,6 +52,8 @@ impl std::fmt::Display for JobStatus {
             JobStatus::InProgress => write!(f, "in_progress"),
             JobStatus::Completed => write!(f, "completed"),
             JobStatus::Failed => write!(f, "failed"),
+            JobStatus::Cancelled => write!(f, "cancelled"),
+            JobStatus::Purged => write!(f, "purged"),
         }
     }
 }
@@ -61,6 +67,8 @@ impl std::str::FromStr for JobStatus {
             "in_progress" => Ok(JobStatus::InProgress),
             "completed" => Ok(JobStatus::Completed),
             "failed" => Ok(JobStatus::Failed),
+            "cancelled" => Ok(JobStatus::Cancelled),
+            "purged" => Ok(JobStatus::Purged),
             _ => Err(format!("Invalid job status: {}", s)),
         }
     }
@@ -74,6 +82,7 @@ pub enum TaskStatus {
     InProgress,
     Completed,
     Failed,
+    Cancelled,
 }
 
 impl std::fmt::Display for TaskStatus {
@@ -83,6 +92,7 @@ impl std::fmt::Display for TaskStatus {
             TaskStatus::InProgress => write!(f, "in_progress"),
             TaskStatus::Completed => write!(f, "completed"),
             TaskStatus::Failed => write!(f, "failed"),
+            TaskStatus::Cancelled => write!(f, "cancelled"),
         }
     }
 }
@@ -96,6 +106,7 @@ impl std::str::FromStr for TaskStatus {
             "in_progress" => Ok(TaskStatus::InProgress),
             "completed" => Ok(TaskStatus::Completed),
             "failed" => Ok(TaskStatus::Failed),
+            "cancelled" => Ok(TaskStatus::Cancelled),
             _ => Err(format!("Invalid task status: {}", s)),
         }
     }
@@ -180,6 +191,14 @@ pub struct HeartbeatRequest {
     pub task_progress: Vec<TaskProgress>,
 }
 
+/// Heartbeat response to server
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HeartbeatResponse {
+    /// Job IDs that have been purged and should have their data deleted
+    pub purge_job_ids: Vec<Uuid>,
+}
+
 /// Create job request
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -191,6 +210,8 @@ pub struct CreateJobRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShardInfo {
     pub shard_id: i32,
+    /// Relative path to shard file (relative to manifest location)
+    pub path: String,
     pub size: u64,
     pub sha256: String,
 }
