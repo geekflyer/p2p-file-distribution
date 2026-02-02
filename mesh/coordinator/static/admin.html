@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mesh Coordinator Dashboard</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; padding: 20px; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        h1 { margin-bottom: 20px; color: #333; }
+        h2 { margin: 20px 0 10px; color: #555; font-size: 1.2em; }
+        h3 { margin: 15px 0 8px; color: #666; font-size: 1em; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #eee; }
+        th { background: #f8f9fa; font-weight: 600; }
+        .status { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; display: inline-block; margin-right: 4px; }
+        .status.active, .status.complete, .status.completed { background: #d4edda; color: #155724; }
+        .status.pending { background: #e2e3e5; color: #383d41; }
+        .status.in_progress { background: #fff3cd; color: #856404; }
+        .status.failed { background: #f8d7da; color: #721c24; }
+        .status.downloading { background: #fff3cd; color: #856404; }
+        .status.uploading { background: #cce5ff; color: #004085; }
+        .status.waiting { background: #e2e3e5; color: #383d41; }
+        .status.idle { background: #f8f9fa; color: #6c757d; }
+        .progress-bar { width: 100%; height: 20px; background: #e9ecef; border-radius: 4px; overflow: hidden; margin: 4px 0; }
+        .progress-fill { height: 100%; background: #28a745; transition: width 0.3s; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+        .metric-card { background: white; border-radius: 8px; padding: 16px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: center; }
+        .metric { font-size: 24px; font-weight: bold; color: #007bff; }
+        .metric.small { font-size: 18px; }
+        .metric-label { font-size: 11px; color: #6c757d; margin-top: 4px; }
+        .shard-grid { display: flex; flex-wrap: wrap; gap: 3px; margin: 8px 0; }
+        .shard { width: 18px; height: 18px; border-radius: 3px; font-size: 9px; display: flex; align-items: center; justify-content: center; font-weight: 500; }
+        .shard.owned { background: #28a745; color: white; }
+        .shard.missing { background: #e9ecef; color: #adb5bd; }
+        .shard.downloading { background: #ffc107; color: #000; animation: pulse 1s infinite; }
+        .shard.uploading { background: #007bff; color: white; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.6; } }
+        .legend { display: flex; gap: 16px; margin: 12px 0; font-size: 12px; color: #666; }
+        .legend-item { display: flex; align-items: center; gap: 6px; }
+        .legend-box { width: 14px; height: 14px; border-radius: 3px; }
+        .server-card { background: #f8f9fa; border-radius: 6px; padding: 16px; margin: 12px 0; }
+        .server-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .server-name { font-weight: 600; color: #333; }
+        .server-progress { color: #6c757d; font-size: 14px; }
+        .gcs-slot { padding: 8px 12px; border-radius: 4px; display: inline-block; margin-top: 8px; }
+        .gcs-slot.available { background: #d4edda; color: #155724; }
+        .gcs-slot.busy { background: #fff3cd; color: #856404; }
+        input[type="text"] { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        input[type="text"]:focus { outline: none; border-color: #007bff; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 14px; }
+        button:hover { background: #0056b3; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: 500; color: #333; }
+        .form-help { font-size: 12px; color: #6c757d; margin-top: 4px; }
+        .message { padding: 10px; border-radius: 4px; margin-top: 10px; }
+        .message.success { background: #d4edda; color: #155724; }
+        .message.error { background: #f8d7da; color: #721c24; }
+        .muted { color: #6c757d; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Mesh Coordinator Dashboard</h1>
+
+        <!-- Metrics -->
+        <div class="grid">
+            <div class="metric-card">
+                <div class="metric" id="metricJob">—</div>
+                <div class="metric-label">Active Job</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric" id="metricShards">—</div>
+                <div class="metric-label">Total Shards</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric" id="metricServers">0</div>
+                <div class="metric-label">Connected Servers</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric" id="metricTransfers">0</div>
+                <div class="metric-label">Active Transfers</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric" id="metricElapsed">—</div>
+                <div class="metric-label">Elapsed Time</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric" id="metricETA">—</div>
+                <div class="metric-label">Est. Remaining</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric" id="metricCompletion">—</div>
+                <div class="metric-label">Est. Completion</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric" id="metricProgress">—</div>
+                <div class="metric-label">Overall Progress</div>
+            </div>
+        </div>
+
+        <!-- Create Job Form -->
+        <div class="card">
+            <h2>Create New Job</h2>
+            <form id="createJobForm" onsubmit="createJob(event)">
+                <div class="form-group">
+                    <label for="gcsManifestPath">GCS Manifest Path</label>
+                    <input type="text" id="gcsManifestPath" name="gcsManifestPath"
+                           placeholder="gs://bucket/path/model.manifest" required
+                           value="gs://test-bucket/models/test-model/test-model.manifest">
+                    <div class="form-help">Path to the .manifest file in GCS. Shards are resolved relative to this path.</div>
+                </div>
+                <button type="submit">Create Job</button>
+                <div id="formMessage"></div>
+            </form>
+        </div>
+
+        <!-- Active Job -->
+        <div class="card" id="activeJobCard">
+            <h2>Active Job</h2>
+            <div id="activeJobContent">
+                <p class="muted">No active job. Create a job to start distributing shards.</p>
+            </div>
+        </div>
+
+        <!-- Server Shard Ownership -->
+        <div class="card">
+            <h2>Server Shard Ownership</h2>
+            <div class="legend">
+                <div class="legend-item"><div class="legend-box" style="background:#28a745"></div> Owned</div>
+                <div class="legend-item"><div class="legend-box" style="background:#ffc107"></div> Downloading</div>
+                <div class="legend-item"><div class="legend-box" style="background:#007bff"></div> Uploading</div>
+                <div class="legend-item"><div class="legend-box" style="background:#e9ecef"></div> Missing</div>
+            </div>
+            <div id="serversContent">
+                <p class="muted">No servers connected yet. Start server-mesh instances to begin.</p>
+            </div>
+        </div>
+
+        <!-- Active Transfers -->
+        <div class="card">
+            <h2>Active Transfers</h2>
+            <div id="transfersContent">
+                <p class="muted">No active transfers</p>
+            </div>
+        </div>
+
+        <!-- Waiting Queue -->
+        <div class="card">
+            <h2>Waiting Queue</h2>
+            <div id="waitingContent">
+                <p class="muted">No servers waiting for work</p>
+            </div>
+        </div>
+
+        <!-- All Jobs -->
+        <div class="card">
+            <h2>All Jobs</h2>
+            <div id="jobsContent">
+                <p class="muted">Loading jobs...</p>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Track job timing state
+        let jobState = {
+            jobId: null,
+            startTime: null,
+            lastProgressUpdate: null,
+            progressHistory: [] // [{time, totalDelivered}]
+        };
+
+        async function refreshStatus() {
+            try {
+                const [statusRes, jobsRes] = await Promise.all([
+                    fetch('/admin/status'),
+                    fetch('/admin/jobs')
+                ]);
+                const data = await statusRes.json();
+                const jobs = await jobsRes.json();
+                updateDashboard(data, jobs);
+                updateJobs(jobs);
+            } catch (err) {
+                console.error('Failed to refresh status:', err);
+            }
+        }
+
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+        }
+
+        function formatDuration(seconds) {
+            if (seconds < 0 || !isFinite(seconds)) return '—';
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = Math.floor(seconds % 60);
+            if (h > 0) return `${h}h ${m}m`;
+            if (m > 0) return `${m}m ${s}s`;
+            return `${s}s`;
+        }
+
+        function formatTime(date) {
+            return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        }
+
+        function updateJobs(jobs) {
+            const content = document.getElementById('jobsContent');
+            if (!jobs || jobs.length === 0) {
+                content.innerHTML = '<p class="muted">No jobs yet</p>';
+                return;
+            }
+
+            let html = '<table><thead><tr><th>Job ID</th><th>Manifest</th><th>Shards</th><th>Size</th><th>Status</th><th>Created</th></tr></thead><tbody>';
+            jobs.forEach(j => {
+                const statusClass = j.status.replace('_', '-');
+                const created = new Date(j.createdAt).toLocaleString();
+                html += `
+                    <tr>
+                        <td>${j.deploymentJobId.substring(0, 8)}...</td>
+                        <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis">${j.gcsManifestPath}</td>
+                        <td>${j.totalShards}</td>
+                        <td>${formatBytes(j.totalSize)}</td>
+                        <td><span class="status ${statusClass}">${j.status}</span></td>
+                        <td>${created}</td>
+                    </tr>
+                `;
+            });
+            html += '</tbody></table>';
+            content.innerHTML = html;
+        }
+
+        function updateDashboard(data, jobs) {
+            // Update metrics
+            document.getElementById('metricJob').textContent =
+                data.active_job ? data.active_job.job_id.substring(0, 8) : '—';
+            document.getElementById('metricShards').textContent =
+                data.active_job ? data.total_shards : '—';
+            document.getElementById('metricServers').textContent = data.connected_servers;
+            document.getElementById('metricTransfers').textContent = data.pending_transfers;
+
+            // Calculate timing metrics
+            if (data.active_job) {
+                const currentJobId = data.active_job.job_id;
+
+                // Reset state if job changed
+                if (jobState.jobId !== currentJobId) {
+                    jobState.jobId = currentJobId;
+                    jobState.progressHistory = [];
+                    // Find job start time from jobs list
+                    const job = jobs?.find(j => j.deploymentJobId === currentJobId);
+                    jobState.startTime = job ? new Date(job.createdAt) : new Date();
+                }
+
+                // Calculate total shards delivered (sum across all servers)
+                const totalDelivered = data.servers.reduce((sum, s) => sum + s.owned_count, 0);
+                const totalNeeded = data.total_shards * data.servers.length;
+                const now = Date.now();
+
+                // Track progress for rate calculation
+                jobState.progressHistory.push({ time: now, delivered: totalDelivered });
+                // Keep only last 30 seconds of history
+                const cutoff = now - 30000;
+                jobState.progressHistory = jobState.progressHistory.filter(p => p.time > cutoff);
+
+                // Calculate elapsed time
+                const elapsedMs = now - jobState.startTime.getTime();
+                const elapsedSec = elapsedMs / 1000;
+                document.getElementById('metricElapsed').textContent = formatDuration(elapsedSec);
+
+                // Calculate progress rate (shards per second over last 30s)
+                let etaSec = null;
+                if (jobState.progressHistory.length >= 2) {
+                    const oldest = jobState.progressHistory[0];
+                    const newest = jobState.progressHistory[jobState.progressHistory.length - 1];
+                    const timeDelta = (newest.time - oldest.time) / 1000;
+                    const deliveredDelta = newest.delivered - oldest.delivered;
+
+                    if (timeDelta > 0 && deliveredDelta > 0) {
+                        const rate = deliveredDelta / timeDelta; // shards per second
+                        const remaining = totalNeeded - totalDelivered;
+                        etaSec = remaining / rate;
+                    }
+                }
+
+                // Display ETA
+                if (totalDelivered >= totalNeeded) {
+                    document.getElementById('metricETA').textContent = 'Done!';
+                    document.getElementById('metricCompletion').textContent = 'Complete';
+                } else if (etaSec !== null && etaSec < 86400) { // Less than 24 hours
+                    document.getElementById('metricETA').textContent = formatDuration(etaSec);
+                    const completionTime = new Date(now + etaSec * 1000);
+                    document.getElementById('metricCompletion').textContent = formatTime(completionTime);
+                } else {
+                    document.getElementById('metricETA').textContent = '—';
+                    document.getElementById('metricCompletion').textContent = '—';
+                }
+
+                // Overall progress percentage
+                const progressPct = totalNeeded > 0 ? Math.round(totalDelivered * 100 / totalNeeded) : 0;
+                document.getElementById('metricProgress').textContent = `${progressPct}%`;
+            } else {
+                // No active job
+                jobState.jobId = null;
+                jobState.startTime = null;
+                jobState.progressHistory = [];
+                document.getElementById('metricElapsed').textContent = '—';
+                document.getElementById('metricETA').textContent = '—';
+                document.getElementById('metricCompletion').textContent = '—';
+                document.getElementById('metricProgress').textContent = '—';
+            }
+
+            // Update active job
+            const jobContent = document.getElementById('activeJobContent');
+            if (data.active_job) {
+                const gcsClass = data.gcs_in_progress ? 'busy' : 'available';
+                const gcsText = data.gcs_in_progress ? 'In use' : 'Available';
+
+                let availHtml = '<div class="shard-grid">';
+                data.shard_availability.forEach((count, i) => {
+                    const cls = count > 0 ? 'owned' : 'missing';
+                    const title = `Shard ${i} — ${count} copies`;
+                    availHtml += `<div class="shard ${cls}" title="${title}">${count > 0 ? count : ''}</div>`;
+                });
+                availHtml += '</div>';
+
+                jobContent.innerHTML = `
+                    <p><strong>Job ID:</strong> ${data.active_job.job_id}<br>
+                    <strong>GCS Path:</strong> ${data.active_job.gcs_base_path}<br>
+                    <strong>Total Shards:</strong> ${data.active_job.total_shards}</p>
+                    <div class="gcs-slot ${gcsClass}">GCS Download Slot: ${gcsText}</div>
+                    <h3>Global Shard Availability</h3>
+                    <div class="legend">
+                        <div class="legend-item"><div class="legend-box" style="background:#28a745"></div> Available (count shown)</div>
+                        <div class="legend-item"><div class="legend-box" style="background:#e9ecef"></div> Not fetched yet</div>
+                    </div>
+                    ${availHtml}
+                `;
+            } else {
+                jobContent.innerHTML = '<p class="muted">No active job. Create a job to start distributing shards.</p>';
+            }
+
+            // Update servers
+            const serversContent = document.getElementById('serversContent');
+            if (data.servers.length === 0) {
+                serversContent.innerHTML = '<p class="muted">No servers connected yet. Start server-mesh instances to begin.</p>';
+            } else {
+                let html = '';
+                data.servers.forEach(server => {
+                    const pct = data.total_shards > 0 ? Math.round(server.owned_count * 100 / data.total_shards) : 0;
+
+                    let statusHtml = '';
+                    if (server.downloading !== null) {
+                        // Find the transfer to show source
+                        const transfer = data.transfers.find(t => t.server === server.address);
+                        const source = transfer ? (transfer.source_type === 'GCS' ? ' from GCS' : ` from ${transfer.upstream}`) : '';
+                        statusHtml += `<span class="status downloading">Downloading shard ${server.downloading}${source}</span>`;
+                    }
+                    if (server.uploading !== null) {
+                        statusHtml += `<span class="status uploading">Uploading shard ${server.uploading}</span>`;
+                    }
+                    if (server.is_waiting) {
+                        statusHtml += '<span class="status waiting">Waiting for work</span>';
+                    }
+                    if (server.downloading === null && server.uploading === null && !server.is_waiting && server.owned_count < data.total_shards) {
+                        statusHtml += '<span class="status idle">Idle</span>';
+                    }
+                    if (server.owned_count === data.total_shards && data.total_shards > 0) {
+                        statusHtml += '<span class="status complete">Complete</span>';
+                    }
+
+                    let shardHtml = '<div class="shard-grid">';
+                    server.shards.forEach((status, i) => {
+                        shardHtml += `<div class="shard ${status}" title="Shard ${i}"></div>`;
+                    });
+                    shardHtml += '</div>';
+
+                    html += `
+                        <div class="server-card">
+                            <div class="server-header">
+                                <span class="server-name">${server.address}</span>
+                                <span class="server-progress">${server.owned_count}/${data.total_shards} shards (${pct}%)</span>
+                            </div>
+                            <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+                            <div style="margin: 8px 0;">${statusHtml}</div>
+                            ${shardHtml}
+                        </div>
+                    `;
+                });
+                serversContent.innerHTML = html;
+            }
+
+            // Update transfers
+            const transfersContent = document.getElementById('transfersContent');
+            if (data.transfers.length === 0) {
+                transfersContent.innerHTML = '<p class="muted">No active transfers</p>';
+            } else {
+                let html = '<table><thead><tr><th>Server</th><th>Shard</th><th>Source</th></tr></thead><tbody>';
+                data.transfers.forEach(t => {
+                    const source = t.source_type === 'GCS' ? 'GCS' : t.upstream;
+                    html += `<tr><td>${t.server}</td><td>${t.shard_id}</td><td>${source}</td></tr>`;
+                });
+                html += '</tbody></table>';
+                transfersContent.innerHTML = html;
+            }
+
+            // Update waiting queue
+            const waitingContent = document.getElementById('waitingContent');
+            if (data.waiting.length === 0) {
+                waitingContent.innerHTML = '<p class="muted">No servers waiting for work</p>';
+            } else {
+                let html = '<table><thead><tr><th>#</th><th>Server</th></tr></thead><tbody>';
+                data.waiting.forEach((addr, i) => {
+                    html += `<tr><td>${i + 1}</td><td>${addr}</td></tr>`;
+                });
+                html += '</tbody></table>';
+                waitingContent.innerHTML = html;
+            }
+        }
+
+        async function createJob(e) {
+            e.preventDefault();
+            const msgDiv = document.getElementById('formMessage');
+            const path = document.getElementById('gcsManifestPath').value;
+
+            try {
+                const res = await fetch('/admin/jobs', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gcsManifestPath: path })
+                });
+
+                if (res.ok) {
+                    const data = await res.json();
+                    msgDiv.className = 'message success';
+                    msgDiv.textContent = 'Job created: ' + data.deploymentJobId;
+                    document.getElementById('gcsManifestPath').value = '';
+                    refreshStatus();
+                } else {
+                    const err = await res.text();
+                    msgDiv.className = 'message error';
+                    msgDiv.textContent = 'Error: ' + err;
+                }
+            } catch (err) {
+                msgDiv.className = 'message error';
+                msgDiv.textContent = 'Error: ' + err.message;
+            }
+        }
+
+        // Initial load and auto-refresh every 2 seconds
+        refreshStatus();
+        setInterval(refreshStatus, 2000);
+    </script>
+</body>
+</html>

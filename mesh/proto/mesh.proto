@@ -1,0 +1,75 @@
+syntax = "proto3";
+package mesh;
+
+// Scheduler service - runs on coordinator, servers call to get work assignments
+service Scheduler {
+  // Server requests work. Coordinator may hold connection (long-poll) until work is available.
+  rpc GetWork(ServerStatus) returns (TransferTask);
+
+  // Server reports completion of a transfer task
+  rpc ReportTransferTaskCompletion(TransferTaskComplete) returns (Empty);
+
+  // Server sends periodic heartbeat
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+}
+
+// ShardTransfer service - runs on each server, peers call to download shards
+service ShardTransfer {
+  // Stream all pieces for a single shard (mesh: one shard per call)
+  rpc StreamShard(ShardRequest) returns (stream PieceData);
+}
+
+// Server status sent when requesting work
+message ServerStatus {
+  string server_address = 1;      // This server's gRPC address (e.g., "10.0.0.5:50051")
+  string job_id = 2;              // Current active job (from last TransferTask, or empty on first call)
+  bytes shards_owned = 3;         // BitMap of owned shards for this job
+}
+
+// Work assignment from coordinator to server
+message TransferTask {
+  enum SourceType {
+    PEER = 0;
+    GCS = 1;
+  }
+  SourceType source_type = 1;
+  string job_id = 2;
+  int32 shard_id = 3;
+  string upstream_server_addr = 4;  // Set if source_type == PEER
+  string gcs_path = 5;              // Set if source_type == GCS (full path like gs://bucket/path)
+  int32 total_shards = 6;           // Total shards in this job (for bitmap sizing)
+}
+
+// Completion notification from server to coordinator
+message TransferTaskComplete {
+  string server_address = 1;
+  string job_id = 2;
+  int32 shard_id = 3;
+}
+
+// Heartbeat request
+message HeartbeatRequest {
+  string server_address = 1;
+}
+
+// Heartbeat response (can include coordinator commands in future)
+message HeartbeatResponse {}
+
+// Request to download a single shard from a peer
+message ShardRequest {
+  string job_id = 1;
+  int32 shard_id = 2;         // Single shard to transfer
+  int32 from_piece = 3;       // Resume from this piece (0 = start)
+}
+
+// Streamed piece data (same as chain architecture for compatibility)
+message PieceData {
+  int32 shard_id = 1;
+  int32 piece_index = 2;
+  int32 total_pieces = 3;     // Total pieces in this shard
+  bytes data = 4;
+  fixed32 crc32c = 5;         // Transfer integrity check
+}
+
+// Empty response
+message Empty {}

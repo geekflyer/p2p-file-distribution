@@ -1,37 +1,64 @@
-# Pipeline - Cascading File Distribution System
+# File Distribution System
 
-Rust workspace that distributes large files across server fleets using P2P cascade topology.
+Two implementations of large file distribution across server fleets:
 
-## Build & Run
+## Directory Structure
 
-```bash
-cargo build --release                    # Build all
-./scripts/start-local.sh                 # Local dev (requires fake-gcs-server on :4443)
-./scripts/gcp-deploy.sh deploy           # Deploy to GCP
+```
+pipeline/           # Chain topology implementation
+  coordinator/      # HTTP + job management
+  server/           # Downloads from GCS or upstream peer
+  common/           # Types + proto
+  scripts/          # start-local.sh, gcp-deploy.sh
+
+mesh/               # P2P mesh topology implementation
+  coordinator/      # gRPC scheduler + HTTP admin
+  server/           # Pull-based work loop
+  common/           # Types + proto
+  scripts/          # (mesh-specific scripts)
+
+scripts/            # Shared scripts (test data generation)
+data/               # Local storage for both
 ```
 
-## Architecture
+## Pipeline (Chain Topology)
 
-- **coordinator/** - HTTP service managing jobs, server assignments, health tracking (SQLite)
-- **server/** - Worker that downloads shards from GCS or upstream peers, serves to downstream via gRPC
-- **common/** - Shared types and protobuf definitions
+Chain of servers where Server N downloads from Server N-1 (or GCS for first server).
 
-## Key Concepts
+```bash
+cd pipeline
+cargo build --release
+./scripts/start-local.sh
+```
 
-- Chain topology: Server N downloads from Server N-1 (or GCS for first server)
-- Shards: Large files split into chunks, tracked via manifest with SHA256 checksums
-- Job lifecycle: created → in_progress → completed/failed/cancelled → purged
+- Coordinator: http://localhost:8080
+- Simple chain assignment based on server order
+
+## Mesh (P2P Topology)
+
+Dynamic shard distribution using rarest-first scheduling.
+
+```bash
+cd mesh
+cargo build --release
+# Start coordinator (port 8081 for HTTP, 50050 for gRPC)
+./target/release/coordinator
+# Start servers
+COORDINATOR_URL=http://localhost:50050 ./target/release/server
+```
+
+- Coordinator HTTP: http://localhost:8081
+- Coordinator gRPC: localhost:50050
+- Rarest-shard-first scheduling, max 1 GCS download globally
+
+## Shared
+
+- **scripts/generate-test-data.sh** - Generate test shards
+- **scripts/upload-test-data.sh** - Upload to GCS/emulator
+- **data/gcs/** - Fake GCS storage
 
 ## Environment Variables
 
-**Coordinator:** `DATA_DIR`, `HTTP_PORT` (8080)
-**Server:** `COORDINATOR_URL`, `SERVER_ADDR`, `GRPC_PORT` (50051), `DATA_DIR`
-**GCS:** `STORAGE_EMULATOR_HOST` (local dev), `GCS_SERVICE_ACCOUNT_PATH` (prod)
-
-## Testing
-
-```bash
-./scripts/generate-test-data.sh          # Generate test shards in data/gcs/
-curl -X POST localhost:8080/admin/jobs -H "Content-Type: application/json" \
-  -d '{"gcsFilePath":"gs://bucket/path","gcsManifestPath":"gs://bucket/path.manifest"}'
-```
+- `STORAGE_EMULATOR_HOST` - GCS emulator URL (e.g., http://localhost:4443)
+- `TEST_ONLY_LIMIT_GCS_BANDWIDTH` - e.g., "10m" for 10 Mbit/s
+- `TEST_ONLY_LIMIT_P2P_BANDWIDTH` - e.g., "5m" for 5 Mbit/s
