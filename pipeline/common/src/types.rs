@@ -171,9 +171,10 @@ pub struct TaskProgress {
     pub last_shard_id_completed: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
-    /// Current throughput in bytes per second (rolling average)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub throughput_bps: Option<u64>,
+    /// Cumulative bytes downloaded for this task
+    pub bytes_downloaded: u64,
+    /// Cumulative bytes uploaded (served to peers) for this task
+    pub bytes_uploaded: u64,
     /// Current shard being downloaded (for UI display, not persisted)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_shard_id: Option<i32>,
@@ -196,6 +197,9 @@ pub struct HeartbeatRequest {
 pub struct HeartbeatResponse {
     /// Job IDs that have been purged and should have their data deleted
     pub purge_job_ids: Vec<Uuid>,
+    /// Job IDs that have been cancelled and should abort in-progress downloads
+    #[serde(default)]
+    pub cancel_job_ids: Vec<Uuid>,
 }
 
 /// Create job request
@@ -252,9 +256,12 @@ pub struct ServerTaskProgress {
     pub server_status: ServerStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upstream: Option<String>,
-    /// Current throughput in bytes per second
+    /// Download throughput in bytes per second (calculated by coordinator)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub throughput_bps: Option<u64>,
+    pub download_throughput_bps: Option<u64>,
+    /// Upload throughput in bytes per second (calculated by coordinator)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_throughput_bps: Option<u64>,
     /// Current shard being downloaded (for UI display)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_shard_id: Option<i32>,

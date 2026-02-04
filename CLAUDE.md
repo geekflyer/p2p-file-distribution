@@ -62,3 +62,24 @@ COORDINATOR_URL=http://localhost:50050 ./target/release/server
 - `STORAGE_EMULATOR_HOST` - GCS emulator URL (e.g., http://localhost:4443)
 - `TEST_ONLY_LIMIT_GCS_BANDWIDTH` - e.g., "10m" for 10 Mbit/s
 - `TEST_ONLY_LIMIT_P2P_BANDWIDTH` - e.g., "5m" for 5 Mbit/s
+
+## Rust Conventions
+
+- **Cross-compilation**: Always use `cross` for building Linux binaries from macOS
+- **TLS**: Use `rustls` instead of OpenSSL (`native-tls`) to avoid dynamic linking issues
+  - For `reqwest`: `default-features = false, features = ["json", "rustls-tls"]`
+- **Cross.toml**: Configure pre-build to install required packages (e.g., protobuf-compiler for gRPC)
+- **SQLite timestamps**: Use ISO8601 TEXT format (e.g., `datetime('now')` in SQL, `chrono::DateTime` in Rust)
+
+## GCP Deployment
+
+When deploying to GCP with code changes, always cross-compile for Linux first:
+
+```bash
+cd pipeline
+cross build --release --target x86_64-unknown-linux-gnu
+gsutil cp target/x86_64-unknown-linux-gnu/release/coordinator gs://pipeline-test-christian/binaries/
+gsutil cp target/x86_64-unknown-linux-gnu/release/server gs://pipeline-test-christian/binaries/
+```
+
+Then create/update the VMs. The binaries in GCS must be Linux x86_64, not macOS.

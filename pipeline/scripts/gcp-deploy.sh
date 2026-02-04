@@ -12,9 +12,8 @@ NUM_SERVERS="${NUM_SERVERS:-100}"
 TEST_DATA_SIZE_GB="${TEST_DATA_SIZE_GB:-100}"
 SHARD_SIZE_MB="${SHARD_SIZE_MB:-1024}"
 
-# VM specs
-COORDINATOR_MACHINE_TYPE="e2-medium"
-SERVER_MACHINE_TYPE="n2-highcpu-2"  # 2 vCPU, 2GB RAM, ~10 Gbps network
+# Load instance specs
+source "$(dirname "$0")/gcp-instance-specs.env"
 
 # Colors
 RED='\033[0;31m'
@@ -190,11 +189,11 @@ STARTUP_EOF
         --machine-type="$COORDINATOR_MACHINE_TYPE" \
         --image-family=debian-12 \
         --image-project=debian-cloud \
-        --boot-disk-size=20GB \
+        --boot-disk-size="$COORDINATOR_DISK_SIZE" \
         --scopes=storage-rw \
         --metadata="bucket=$BUCKET_NAME" \
         --metadata-from-file=startup-script=/tmp/coordinator-startup.sh \
-        --tags=pipeline-coordinator
+        --tags=pipeline-coordinator,http-server
 
     rm /tmp/coordinator-startup.sh
 
@@ -421,7 +420,7 @@ STARTUP_EOF
         --machine-type="$SERVER_MACHINE_TYPE" \
         --image-family=debian-12 \
         --image-project=debian-cloud \
-        --boot-disk-size=120GB \
+        --boot-disk-size="$SERVER_DISK_SIZE" \
         --boot-disk-type=pd-ssd \
         --scopes=storage-rw \
         --tags=pipeline-server \

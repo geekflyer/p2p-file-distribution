@@ -63,7 +63,14 @@ async fn init_db(pool: &DbPool) -> Result<(), sqlx::Error> {
             last_shard_id_completed INTEGER NOT NULL DEFAULT -1,
             current_shard_id INTEGER,
             current_shard_progress_pct REAL,
-            throughput_bps INTEGER,
+            prev_bytes_downloaded INTEGER,
+            prev_bytes_downloaded_at TEXT,
+            now_bytes_downloaded INTEGER,
+            now_bytes_downloaded_at TEXT,
+            prev_bytes_uploaded INTEGER,
+            prev_bytes_uploaded_at TEXT,
+            now_bytes_uploaded INTEGER,
+            now_bytes_uploaded_at TEXT,
             status TEXT NOT NULL DEFAULT 'created',
             updated_at TEXT NOT NULL DEFAULT (datetime('now')),
             PRIMARY KEY (server_address, deployment_job_id)
@@ -284,9 +291,15 @@ pub async fn get_job_server_progress(
     pool: &DbPool,
     job_id: Uuid,
 ) -> Result<Vec<ServerTaskProgress>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, i32, Option<i32>, Option<f64>, Option<i64>, String, String)>(
+    // Query includes fields for throughput calculation
+    let rows = sqlx::query_as::<_, (String, i32, Option<i32>, Option<f64>, Option<i64>, Option<String>, Option<i64>, Option<String>, Option<i64>, Option<String>, Option<i64>, Option<String>, String, String)>(
         r#"
-        SELECT t.server_address, t.last_shard_id_completed, t.current_shard_id, t.current_shard_progress_pct, t.throughput_bps, t.status, COALESCE(s.status, 'unhealthy') as server_status
+        SELECT t.server_address, t.last_shard_id_completed, t.current_shard_id, t.current_shard_progress_pct,
+               t.prev_bytes_downloaded, t.prev_bytes_downloaded_at,
+               t.now_bytes_downloaded, t.now_bytes_downloaded_at,
+               t.prev_bytes_uploaded, t.prev_bytes_uploaded_at,
+               t.now_bytes_uploaded, t.now_bytes_uploaded_at,
+               t.status, COALESCE(s.status, 'unhealthy') as server_status
         FROM server_model_deployment_tasks t
         LEFT JOIN servers s ON t.server_address = s.server_address
         WHERE t.deployment_job_id = $1
@@ -299,17 +312,56 @@ pub async fn get_job_server_progress(
 
     Ok(rows
         .into_iter()
-        .map(|(server_address, last_shard_id_completed, current_shard_id, current_shard_progress_pct, throughput_bps, status, server_status)| ServerTaskProgress {
-            server_address,
-            last_shard_id_completed,
-            status: status.parse().unwrap_or(TaskStatus::Failed),
-            server_status: server_status.parse().unwrap_or(ServerStatus::Unhealthy),
-            upstream: None,
-            throughput_bps: throughput_bps.map(|t| t as u64),
-            current_shard_id,
-            current_shard_progress_pct: current_shard_progress_pct.map(|p| p as f32),
+        .map(|(server_address, last_shard_id_completed, current_shard_id, current_shard_progress_pct,
+               prev_bytes_dl, prev_bytes_dl_at, now_bytes_dl, now_bytes_dl_at,
+               prev_bytes_ul, prev_bytes_ul_at, now_bytes_ul, now_bytes_ul_at,
+               status, server_status)| {
+            // Calculate download throughput
+            let download_throughput_bps = calculate_throughput(
+                prev_bytes_dl, prev_bytes_dl_at.as_deref(),
+                now_bytes_dl, now_bytes_dl_at.as_deref(),
+            );
+            // Calculate upload throughput
+            let upload_throughput_bps = calculate_throughput(
+                prev_bytes_ul, prev_bytes_ul_at.as_deref(),
+                now_bytes_ul, now_bytes_ul_at.as_deref(),
+            );
+
+            ServerTaskProgress {
+                server_address,
+                last_shard_id_completed,
+                status: status.parse().unwrap_or(TaskStatus::Failed),
+                server_status: server_status.parse().unwrap_or(ServerStatus::Unhealthy),
+                upstream: None,
+                download_throughput_bps,
+                upload_throughput_bps,
+                current_shard_id,
+                current_shard_progress_pct: current_shard_progress_pct.map(|p| p as f32),
+            }
         })
         .collect())
+}
+
+/// Calculate throughput from prev/now byte counts and timestamps
+fn calculate_throughput(
+    prev_bytes: Option<i64>,
+    prev_at: Option<&str>,
+    now_bytes: Option<i64>,
+    now_at: Option<&str>,
+) -> Option<u64> {
+    let prev_bytes = prev_bytes?;
+    let now_bytes = now_bytes?;
+    let prev_at = parse_datetime(prev_at?)?;
+    let now_at = parse_datetime(now_at?)?;
+
+    let bytes_delta = now_bytes.saturating_sub(prev_bytes);
+    let time_delta_secs = (now_at - prev_at).num_milliseconds() as f64 / 1000.0;
+
+    if time_delta_secs > 0.0 && bytes_delta > 0 {
+        Some((bytes_delta as f64 / time_delta_secs) as u64)
+    } else {
+        None
+    }
 }
 
 // ============ Task Operations ============
@@ -324,7 +376,7 @@ pub async fn get_server_tasks(
         SELECT j.deployment_job_id, j.gcs_manifest_path, j.total_shards, j.shard_size
         FROM server_model_deployment_tasks t
         JOIN model_deployment_jobs j ON t.deployment_job_id = j.deployment_job_id
-        WHERE t.server_address = $1 AND t.status != 'completed'
+        WHERE t.server_address = $1 AND t.status NOT IN ('completed', 'cancelled')
         ORDER BY j.created_at
         "#,
     )
@@ -348,6 +400,7 @@ pub async fn get_server_tasks(
 
 /// Update task progress - only writes last_shard_id_completed when shard completes
 /// Always updates current progress for UI display
+/// Shifts now_* values to prev_* before updating with new values
 pub async fn update_task_progress(
     pool: &DbPool,
     server_address: &str,
@@ -356,10 +409,12 @@ pub async fn update_task_progress(
     current_shard_id: Option<i32>,
     current_shard_progress_pct: Option<f32>,
     completed: bool,
-    throughput_bps: Option<u64>,
+    bytes_downloaded: u64,
+    bytes_uploaded: u64,
 ) -> Result<(), sqlx::Error> {
     let status = if completed { "completed" } else { "in_progress" };
 
+    // Shift now_* to prev_*, then update now_* with new values
     // Only update tasks that are not in a terminal state (cancelled)
     sqlx::query(
         r#"
@@ -368,9 +423,16 @@ pub async fn update_task_progress(
             current_shard_id = $2,
             current_shard_progress_pct = $3,
             status = $4,
-            throughput_bps = $5,
+            prev_bytes_downloaded = now_bytes_downloaded,
+            prev_bytes_downloaded_at = now_bytes_downloaded_at,
+            now_bytes_downloaded = $5,
+            now_bytes_downloaded_at = datetime('now'),
+            prev_bytes_uploaded = now_bytes_uploaded,
+            prev_bytes_uploaded_at = now_bytes_uploaded_at,
+            now_bytes_uploaded = $6,
+            now_bytes_uploaded_at = datetime('now'),
             updated_at = datetime('now')
-        WHERE server_address = $6 AND deployment_job_id = $7
+        WHERE server_address = $7 AND deployment_job_id = $8
           AND status NOT IN ('cancelled')
         "#,
     )
@@ -378,7 +440,8 @@ pub async fn update_task_progress(
     .bind(current_shard_id)
     .bind(current_shard_progress_pct.map(|p| p as f64))
     .bind(status)
-    .bind(throughput_bps.map(|t| t as i64))
+    .bind(bytes_downloaded as i64)
+    .bind(bytes_uploaded as i64)
     .bind(server_address)
     .bind(job_id.to_string())
     .execute(pool)
@@ -486,6 +549,20 @@ pub async fn purge_job(pool: &DbPool, job_id: Uuid) -> Result<bool, sqlx::Error>
 pub async fn get_purged_job_ids(pool: &DbPool) -> Result<Vec<Uuid>, sqlx::Error> {
     let rows = sqlx::query_as::<_, (String,)>(
         "SELECT deployment_job_id FROM model_deployment_jobs WHERE status = 'purged'",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id,)| Uuid::parse_str(&id).ok())
+        .collect())
+}
+
+/// Get all cancelled job IDs (for servers to abort in-progress downloads)
+pub async fn get_cancelled_job_ids(pool: &DbPool) -> Result<Vec<Uuid>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (String,)>(
+        "SELECT deployment_job_id FROM model_deployment_jobs WHERE status = 'cancelled'",
     )
     .fetch_all(pool)
     .await?;

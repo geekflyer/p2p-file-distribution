@@ -6,7 +6,7 @@ mod storage;
 
 use chrono::Utc;
 use common::TaskProgress;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,15 +17,17 @@ use uuid::Uuid;
 use common::UpstreamType;
 use coordinator_client::CoordinatorClient;
 use downloader::Downloader;
-use file_service::FileService;
+use file_service::{FileService, UploadTracker};
 use storage::ShardStorage;
 
 struct TaskState {
     /// Last fully completed shard
     last_shard_completed: i32,
     completed: bool,
-    /// Current throughput in bytes per second
-    throughput_bps: Option<u64>,
+    /// Cumulative bytes from completed shards
+    bytes_downloaded_completed: u64,
+    /// Bytes downloaded in current shard (transient, reset per shard)
+    bytes_downloaded_current: u64,
     /// Current shard being downloaded
     current_shard_id: Option<i32>,
     /// Progress within current shard (0-100%)
@@ -86,8 +88,14 @@ async fn main() -> anyhow::Result<()> {
     // Track task states
     let task_states: Arc<RwLock<HashMap<Uuid, TaskState>>> = Arc::new(RwLock::new(HashMap::new()));
 
+    // Track cancelled job IDs (to abort in-progress downloads)
+    let cancelled_jobs: Arc<RwLock<HashSet<Uuid>>> = Arc::new(RwLock::new(HashSet::new()));
+
+    // Track uploaded bytes per job
+    let upload_tracker: UploadTracker = Arc::new(RwLock::new(HashMap::new()));
+
     // Spawn gRPC server
-    let file_service = FileService::new(storage.clone());
+    let file_service = FileService::new(storage.clone(), upload_tracker.clone());
     let grpc_addr = format!("0.0.0.0:{}", grpc_port).parse()?;
     tokio::spawn(async move {
         tracing::info!("Starting gRPC server on {}", grpc_addr);
@@ -103,37 +111,57 @@ async fn main() -> anyhow::Result<()> {
     // Spawn heartbeat task
     let heartbeat_states = task_states.clone();
     let heartbeat_storage = storage.clone();
+    let heartbeat_upload_tracker = upload_tracker.clone();
+    let heartbeat_cancelled = cancelled_jobs.clone();
     let heartbeat_coordinator = CoordinatorClient::new(
         std::env::var("COORDINATOR_URL").unwrap_or_else(|_| "http://localhost:8080".to_string()),
         server_addr.clone(),
     );
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
         loop {
             interval.tick().await;
 
             let states = heartbeat_states.read().await;
+            let uploads = heartbeat_upload_tracker.read().await;
             let progress: Vec<TaskProgress> = states
                 .iter()
                 .map(|(job_id, state)| TaskProgress {
                     deployment_job_id: *job_id,
                     last_shard_id_completed: state.last_shard_completed,
                     completed_at: if state.completed { Some(Utc::now()) } else { None },
-                    throughput_bps: state.throughput_bps,
+                    bytes_downloaded: state.bytes_downloaded_completed + state.bytes_downloaded_current,
+                    bytes_uploaded: *uploads.get(job_id).unwrap_or(&0),
                     current_shard_id: state.current_shard_id,
                     current_shard_progress_pct: state.current_shard_progress_pct,
                 })
                 .collect();
             drop(states);
+            drop(uploads);
 
             match heartbeat_coordinator.heartbeat(progress).await {
                 Ok(response) => {
+                    // Handle cancel requests - add to cancelled set so download loop can check
+                    if !response.cancel_job_ids.is_empty() {
+                        let mut cancelled = heartbeat_cancelled.write().await;
+                        for job_id in &response.cancel_job_ids {
+                            if cancelled.insert(*job_id) {
+                                tracing::info!("Job {} cancelled, will abort download", job_id);
+                            }
+                        }
+                    }
+
                     // Handle purge requests
                     for job_id in response.purge_job_ids {
                         // Remove from task states
                         {
                             let mut states = heartbeat_states.write().await;
                             states.remove(&job_id);
+                        }
+                        // Remove from cancelled set
+                        {
+                            let mut cancelled = heartbeat_cancelled.write().await;
+                            cancelled.remove(&job_id);
                         }
                         // Delete data from storage
                         if let Err(e) = heartbeat_storage.delete_job(job_id).await {
@@ -173,6 +201,15 @@ async fn main() -> anyhow::Result<()> {
         for task in tasks {
             let job_id = task.deployment_job_id;
 
+            // Skip cancelled jobs
+            {
+                let cancelled = cancelled_jobs.read().await;
+                if cancelled.contains(&job_id) {
+                    tracing::info!("Skipping cancelled job {}", job_id);
+                    continue;
+                }
+            }
+
             // Get upstream assignment for this specific job
             let upstream = match coordinator.get_upstream(Some(job_id)).await {
                 Ok(upstream) => upstream,
@@ -209,7 +246,8 @@ async fn main() -> anyhow::Result<()> {
                 states.entry(job_id).or_insert(TaskState {
                     last_shard_completed: start_from_shard - 1,
                     completed: false,
-                    throughput_bps: None,
+                    bytes_downloaded_completed: 0,
+                    bytes_downloaded_current: 0,
                     current_shard_id: None,
                     current_shard_progress_pct: None,
                 });
@@ -252,6 +290,15 @@ async fn main() -> anyhow::Result<()> {
 
             // Download shards
             for shard_id in start_from_shard..task.total_shards {
+                // Check if job was cancelled
+                {
+                    let cancelled = cancelled_jobs.read().await;
+                    if cancelled.contains(&job_id) {
+                        tracing::info!("Job {} cancelled, aborting download at shard {}", job_id, shard_id);
+                        break;
+                    }
+                }
+
                 // Update current shard being worked on
                 {
                     let mut states = task_states.write().await;
@@ -263,15 +310,16 @@ async fn main() -> anyhow::Result<()> {
 
                 // Progress callback for bytes within this shard
                 let task_states_clone = task_states.clone();
-                let progress_callback = move |bytes_downloaded: u64, total_bytes: u64, throughput_bps: Option<u64>| {
+                let progress_callback = move |bytes_in_shard: u64, total_bytes: u64, _throughput_bps: Option<u64>| {
                     let states = task_states_clone.clone();
                     async move {
                         let mut states = states.write().await;
                         if let Some(state) = states.get_mut(&job_id) {
-                            state.throughput_bps = throughput_bps;
+                            // Store current shard's cumulative progress (not a delta)
+                            state.bytes_downloaded_current = bytes_in_shard;
                             // Calculate progress within shard as percentage
                             let progress_pct = if total_bytes > 0 {
-                                (bytes_downloaded as f32 / total_bytes as f32) * 100.0
+                                (bytes_in_shard as f32 / total_bytes as f32) * 100.0
                             } else {
                                 0.0
                             };
@@ -323,6 +371,9 @@ async fn main() -> anyhow::Result<()> {
                             // Shard completed and verified
                             let mut states = task_states.write().await;
                             if let Some(state) = states.get_mut(&job_id) {
+                                // Move current shard bytes to completed total
+                                state.bytes_downloaded_completed += shard_size;
+                                state.bytes_downloaded_current = 0;
                                 state.last_shard_completed = shard_id;
                                 if shard_id >= task.total_shards - 1 {
                                     state.completed = true;

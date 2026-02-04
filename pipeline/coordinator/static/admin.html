@@ -111,7 +111,8 @@
                             <th>Upstream</th>
                             <th>Task</th>
                             <th>Progress</th>
-                            <th>Throughput</th>
+                            <th>Download</th>
+                            <th>Upload</th>
                         </tr>
                     </thead>
                     <tbody></tbody>
@@ -353,8 +354,9 @@
                     const progress = totalShards > 0 ? (effectiveProgress / totalShards * 100).toFixed(1) : 0;
                     const bytesComplete = Math.min(effectiveProgress * shardSize, totalSize);
 
-                    // Use server-reported throughput
-                    const throughput = p.throughputBps ? formatThroughput(p.throughputBps) : '-';
+                    // Use calculated throughputs
+                    const downloadThroughput = p.downloadThroughputBps ? formatThroughput(p.downloadThroughputBps) : '-';
+                    const uploadThroughput = p.uploadThroughputBps ? formatThroughput(p.uploadThroughputBps) : '-';
 
                     // Show current shard being worked on
                     let currentShardInfo = '';
@@ -375,7 +377,8 @@
                                 ${formatBytes(bytesComplete)} / ${formatBytes(totalSize)} (${progress}%)<br>
                                 <span style="color: #6c757d; font-size: 12px;">${shardsComplete} / ${totalShards} shards${currentShardInfo}</span>
                             </td>
-                            <td class="throughput">${throughput}</td>
+                            <td class="throughput">${downloadThroughput}</td>
+                            <td class="throughput">${uploadThroughput}</td>
                         </tr>
                     `;
                 }).join('');

@@ -1,7 +1,8 @@
 use common::proto::file_transfer_server::{FileTransfer, FileTransferServer};
 use common::proto::{PieceData, ShardRequest};
+use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -15,13 +16,17 @@ const STREAM_CHUNK_SIZE: usize = 1 * 1024 * 1024;
 /// How long to wait for new data before checking again
 const POLL_INTERVAL_MS: u64 = 50;
 
+/// Tracks cumulative bytes uploaded per job
+pub type UploadTracker = Arc<RwLock<HashMap<Uuid, u64>>>;
+
 pub struct FileService {
     storage: Arc<ShardStorage>,
+    upload_tracker: UploadTracker,
 }
 
 impl FileService {
-    pub fn new(storage: Arc<ShardStorage>) -> Self {
-        Self { storage }
+    pub fn new(storage: Arc<ShardStorage>, upload_tracker: UploadTracker) -> Self {
+        Self { storage, upload_tracker }
     }
 
     pub fn into_server(self) -> FileTransferServer<Self> {
@@ -46,6 +51,7 @@ impl FileTransfer for FileService {
 
         let shard_id = req.from_shard;
         let storage = self.storage.clone();
+        let upload_tracker = self.upload_tracker.clone();
 
         let (tx, rx) = mpsc::channel(16);
 
@@ -164,6 +170,12 @@ impl FileTransfer for FileService {
                             shard_id, bytes_sent, piece_index
                         );
                         return;
+                    }
+
+                    // Track uploaded bytes
+                    {
+                        let mut tracker = upload_tracker.write().await;
+                        *tracker.entry(job_id).or_insert(0) += chunk_size as u64;
                     }
 
                     bytes_sent += chunk_size as u64;

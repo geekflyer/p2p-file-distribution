@@ -121,7 +121,8 @@ pub async fn heartbeat(
         deployment_job_id,
         last_shard_id_completed,
         completed_at,
-        throughput_bps,
+        bytes_downloaded,
+        bytes_uploaded,
         current_shard_id,
         current_shard_progress_pct,
     } in request.task_progress
@@ -135,7 +136,8 @@ pub async fn heartbeat(
             current_shard_id,
             current_shard_progress_pct,
             completed,
-            throughput_bps,
+            bytes_downloaded,
+            bytes_uploaded,
         )
         .await
         {
@@ -143,12 +145,15 @@ pub async fn heartbeat(
         }
     }
 
-    // Return list of purged jobs for cleanup
+    // Return list of purged jobs for cleanup and cancelled jobs to abort
     let purge_job_ids = db::get_purged_job_ids(&state.pool)
         .await
         .unwrap_or_default();
+    let cancel_job_ids = db::get_cancelled_job_ids(&state.pool)
+        .await
+        .unwrap_or_default();
 
-    Json(HeartbeatResponse { purge_job_ids }).into_response()
+    Json(HeartbeatResponse { purge_job_ids, cancel_job_ids }).into_response()
 }
 
 // ============ Admin API Handlers ============

@@ -30,3 +30,6 @@ Thumbs.db
 # Credentials (service account keys)
 *-service-account.json
 *-credentials.json
+
+# Local notes
+local-notes.md
