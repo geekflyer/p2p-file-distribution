@@ -1,6 +1,7 @@
 use common::proto::TransferTask;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{oneshot, Mutex, Notify};
 
 /// Represents a server waiting for work assignment
@@ -47,6 +48,10 @@ pub struct SchedulerState {
     /// Set of servers currently uploading (their address is in pending_tasks as upstream)
     /// Enables O(1) lookup of "is server X uploading" instead of scanning pending_tasks
     pub servers_uploading: Mutex<HashSet<String>>,
+
+    /// When each pending task was started: Map<server_address, start_time>
+    /// Used to detect and timeout stuck tasks
+    pub task_start_times: Mutex<HashMap<String, Instant>>,
 }
 
 #[derive(Clone)]
@@ -54,6 +59,7 @@ pub struct ActiveJob {
     pub job_id: String,
     pub total_shards: i32,
     pub gcs_base_path: String,
+    pub shard_size: u64,
 }
 
 impl SchedulerState {
@@ -69,6 +75,7 @@ impl SchedulerState {
             server_heartbeats: Mutex::new(HashMap::new()),
             shard_to_servers: Mutex::new(HashMap::new()),
             servers_uploading: Mutex::new(HashSet::new()),
+            task_start_times: Mutex::new(HashMap::new()),
         })
     }
 
@@ -129,6 +136,7 @@ impl Default for SchedulerState {
             server_heartbeats: Mutex::new(HashMap::new()),
             shard_to_servers: Mutex::new(HashMap::new()),
             servers_uploading: Mutex::new(HashSet::new()),
+            task_start_times: Mutex::new(HashMap::new()),
         }
     }
 }

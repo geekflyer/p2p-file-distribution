@@ -25,6 +25,11 @@ impl ShardStorage {
             .join(format!("shard_{:04}.bin.partial", shard_id))
     }
 
+    /// Get the path for a partial shard file (public version for parallel downloads)
+    pub fn get_partial_path(&self, job_id: &str, shard_id: i32) -> PathBuf {
+        self.partial_path(job_id, shard_id)
+    }
+
     /// Get the job directory path
     fn job_dir(&self, job_id: &str) -> PathBuf {
         self.data_dir.join(job_id)

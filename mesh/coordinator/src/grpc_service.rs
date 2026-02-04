@@ -58,6 +58,7 @@ impl Scheduler for SchedulerService {
                         upstream_server_addr: String::new(),
                         gcs_path: String::new(),
                         total_shards: job.total_shards,
+                        shard_size: job.shard_size,
                     }));
                 }
             }

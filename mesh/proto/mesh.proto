@@ -38,6 +38,7 @@ message TransferTask {
   string upstream_server_addr = 4;  // Set if source_type == PEER
   string gcs_path = 5;              // Set if source_type == GCS (full path like gs://bucket/path)
   int32 total_shards = 6;           // Total shards in this job (for bitmap sizing)
+  uint64 shard_size = 7;            // Size of this shard in bytes (for parallel downloads)
 }
 
 // Completion notification from server to coordinator

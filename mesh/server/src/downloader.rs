@@ -6,6 +6,7 @@ use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -13,6 +14,11 @@ use tokio::sync::RwLock;
 use crate::storage::{ShardStorage, compute_crc32c};
 
 const GRPC_MAX_MESSAGE_SIZE: usize = 512 * 1024 * 1024; // 512MB
+
+/// Number of parallel range requests for GCS downloads
+/// Default to 2 to avoid OOM on memory-constrained VMs (n2-highcpu-2 has only 2GB RAM)
+/// Each parallel download holds ~shard_size/num_ranges in memory before writing to disk
+const DEFAULT_GCS_PARALLEL_RANGES: usize = 2;
 
 pub struct Downloader {
     storage: Arc<ShardStorage>,
@@ -199,6 +205,125 @@ impl Downloader {
         Ok(true)
     }
 
+    /// Download a single shard from GCS using sequential range requests
+    /// Streams directly to disk to avoid OOM on memory-constrained VMs
+    /// Still benefits from efficient TCP connection reuse
+    pub async fn download_shard_from_gcs_parallel(
+        &self,
+        job_id: &str,
+        gcs_path: &str,
+        shard_id: i32,
+        shard_size: u64,
+    ) -> anyhow::Result<bool> {
+        use std::io::SeekFrom;
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt, AsyncReadExt};
+
+        let (bucket, object) = parse_gcs_path(gcs_path)?;
+
+        let num_ranges = std::env::var("GCS_PARALLEL_RANGES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_GCS_PARALLEL_RANGES);
+
+        tracing::info!(
+            "Downloading shard {} from GCS ({} sequential ranges): {}",
+            shard_id, num_ranges, gcs_path
+        );
+
+        let download_start = Instant::now();
+
+        let store = self.get_store(bucket).await?;
+        let path = ObjectPath::from(object);
+
+        // Calculate ranges
+        let ranges = calculate_ranges(shard_size, num_ranges);
+
+        // Create the partial file upfront
+        self.storage.start_partial_shard(job_id, shard_id).await?;
+        let partial_path = self.storage.get_partial_path(job_id, shard_id);
+
+        // Pre-allocate the file to the expected size
+        {
+            let file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&partial_path)
+                .await?;
+            file.set_len(shard_size).await?;
+        }
+
+        // Download ranges sequentially to limit memory usage
+        // Each range is downloaded and immediately written to disk before the next starts
+        let mut total_bytes = 0u64;
+        for (idx, range) in ranges.into_iter().enumerate() {
+            let range_start = range.start as u64;
+
+            // Download the range
+            let data = match store.get_range(&path, range.clone()).await {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::warn!(
+                        "GCS range {} download error for shard {}: {} - will retry",
+                        idx, shard_id, e
+                    );
+                    self.storage.abort_partial(job_id, shard_id).await?;
+                    return Ok(false);
+                }
+            };
+
+            // Write directly to file at the correct offset
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .open(&partial_path)
+                .await?;
+            file.seek(SeekFrom::Start(range_start)).await?;
+            file.write_all(&data).await?;
+            file.flush().await?;
+
+            total_bytes += data.len() as u64;
+            tracing::debug!(
+                "Shard {} range {}/{} complete ({} bytes)",
+                shard_id, idx + 1, num_ranges, data.len()
+            );
+        }
+
+        // Verify total bytes downloaded
+        if total_bytes != shard_size {
+            tracing::warn!(
+                "Shard {} size mismatch: expected {}, got {} - will retry",
+                shard_id, shard_size, total_bytes
+            );
+            self.storage.abort_partial(job_id, shard_id).await?;
+            return Ok(false);
+        }
+
+        // Stream file through SHA256 hasher (using small buffer to avoid OOM)
+        let mut sha256_hasher = Sha256::new();
+        {
+            let mut file = tokio::fs::File::open(&partial_path).await?;
+            let mut buf = vec![0u8; 256 * 1024]; // 256KB buffer
+            loop {
+                let n = file.read(&mut buf).await?;
+                if n == 0 {
+                    break;
+                }
+                sha256_hasher.update(&buf[..n]);
+            }
+        }
+        let computed_sha256 = hex::encode(sha256_hasher.finalize());
+
+        let download_elapsed = download_start.elapsed();
+        let throughput_mbps = (shard_size as f64 * 8.0) / download_elapsed.as_secs_f64() / 1_000_000.0;
+        tracing::info!(
+            "Shard {} SHA256: {} ({} bytes, {:.1} Mbit/s)",
+            shard_id, computed_sha256, shard_size, throughput_mbps
+        );
+
+        // Finalize the shard
+        self.storage.finalize_shard(job_id, shard_id).await?;
+
+        Ok(true)
+    }
+
     /// Download a single shard from a peer
     pub async fn download_shard_from_peer(
         &self,
@@ -325,4 +450,20 @@ fn parse_bandwidth_limit(s: &str) -> Option<u64> {
     };
 
     num_str.parse::<u64>().ok().map(|n| n * multiplier)
+}
+
+/// Calculate byte ranges for parallel download
+fn calculate_ranges(total_size: u64, num_ranges: usize) -> Vec<Range<usize>> {
+    let range_size = total_size / num_ranges as u64;
+    (0..num_ranges)
+        .map(|i| {
+            let start = i as u64 * range_size;
+            let end = if i == num_ranges - 1 {
+                total_size
+            } else {
+                (i + 1) as u64 * range_size
+            };
+            (start as usize)..(end as usize)
+        })
+        .collect()
 }

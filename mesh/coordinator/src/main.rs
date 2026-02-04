@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
                 job_id: job.job_id.to_string(),
                 total_shards: job.total_shards,
                 gcs_base_path: job.gcs_base_path,
+                shard_size: job.shard_size,
             },
         )
         .await;
@@ -144,6 +145,7 @@ async fn job_queue_processor(pool: db::DbPool, state: Arc<SchedulerState>) {
                             job_id: job.job_id.to_string(),
                             total_shards: job.total_shards,
                             gcs_base_path: job.gcs_base_path,
+                            shard_size: job.shard_size,
                         },
                     )
                     .await;

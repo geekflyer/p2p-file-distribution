@@ -66,7 +66,7 @@ COORDINATOR_URL=http://localhost:50050 ./target/release/server
 ## Rust Conventions
 
 - **Cross-compilation**: Always use `cross` for building Linux binaries from macOS
-- **TLS**: Use `rustls` instead of OpenSSL (`native-tls`) to avoid dynamic linking issues
+- **TLS**: Use `rustls` instead of OpenSSL (`native-tls` | `libssl-dev`) to avoid dynamic linking issues
   - For `reqwest`: `default-features = false, features = ["json", "rustls-tls"]`
 - **Cross.toml**: Configure pre-build to install required packages (e.g., protobuf-compiler for gRPC)
 - **SQLite timestamps**: Use ISO8601 TEXT format (e.g., `datetime('now')` in SQL, `chrono::DateTime` in Rust)

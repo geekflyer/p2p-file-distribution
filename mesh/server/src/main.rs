@@ -148,7 +148,19 @@ async fn main() -> anyhow::Result<()> {
         // Execute transfer
         let success = match source_type {
             SourceType::Gcs => {
-                match downloader.download_shard_from_gcs(&task.job_id, &task.gcs_path, task.shard_id).await {
+                // Use parallel download for production GCS when shard_size is known
+                let use_parallel = task.shard_size > 0 && std::env::var("STORAGE_EMULATOR_HOST").is_err();
+                let result = if use_parallel {
+                    downloader.download_shard_from_gcs_parallel(
+                        &task.job_id,
+                        &task.gcs_path,
+                        task.shard_id,
+                        task.shard_size,
+                    ).await
+                } else {
+                    downloader.download_shard_from_gcs(&task.job_id, &task.gcs_path, task.shard_id).await
+                };
+                match result {
                     Ok(success) => success,
                     Err(e) => {
                         error!("GCS download error: {}", e);
