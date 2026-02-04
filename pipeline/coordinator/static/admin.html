@@ -165,7 +165,8 @@
         }
 
         function formatThroughput(bytesPerSec) {
-            if (bytesPerSec <= 0) return '-';
+            if (bytesPerSec === 0) return '0 B/s';
+            if (bytesPerSec < 0) return '-';
             return formatBytes(bytesPerSec) + '/s';
         }
 
@@ -354,9 +355,9 @@
                     const progress = totalShards > 0 ? (effectiveProgress / totalShards * 100).toFixed(1) : 0;
                     const bytesComplete = Math.min(effectiveProgress * shardSize, totalSize);
 
-                    // Use calculated throughputs
-                    const downloadThroughput = p.downloadThroughputBps ? formatThroughput(p.downloadThroughputBps) : '-';
-                    const uploadThroughput = p.uploadThroughputBps ? formatThroughput(p.uploadThroughputBps) : '-';
+                    // Use calculated throughputs (check for null, not falsy, since 0 is valid)
+                    const downloadThroughput = p.downloadThroughputBps != null ? formatThroughput(p.downloadThroughputBps) : '-';
+                    const uploadThroughput = p.uploadThroughputBps != null ? formatThroughput(p.uploadThroughputBps) : '-';
 
                     // Show current shard being worked on
                     let currentShardInfo = '';

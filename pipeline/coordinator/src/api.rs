@@ -123,6 +123,8 @@ pub async fn heartbeat(
         completed_at,
         bytes_downloaded,
         bytes_uploaded,
+        download_throughput_bps,
+        upload_throughput_bps,
         current_shard_id,
         current_shard_progress_pct,
     } in request.task_progress
@@ -138,6 +140,8 @@ pub async fn heartbeat(
             completed,
             bytes_downloaded,
             bytes_uploaded,
+            download_throughput_bps,
+            upload_throughput_bps,
         )
         .await
         {

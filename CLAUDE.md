@@ -71,6 +71,12 @@ COORDINATOR_URL=http://localhost:50050 ./target/release/server
 - **Cross.toml**: Configure pre-build to install required packages (e.g., protobuf-compiler for gRPC)
 - **SQLite timestamps**: Use ISO8601 TEXT format (e.g., `datetime('now')` in SQL, `chrono::DateTime` in Rust)
 
+## Code Cleanup
+
+- **Delete dead code immediately**: When refactoring or changing approaches, remove unused functions, struct fields, database columns, and API parameters right away. Don't leave orphaned code "for later".
+- **Check for unused imports**: After removing code, clean up any imports that are no longer needed.
+- **Database migrations**: When removing columns, add migration queries to drop them (SQLite requires table recreation for column removal, so at minimum stop writing to them).
+
 ## GCP Deployment
 
 When deploying to GCP with code changes, always cross-compile for Linux first:

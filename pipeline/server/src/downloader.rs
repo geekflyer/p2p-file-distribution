@@ -8,13 +8,18 @@ use object_store::ObjectStore;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::constants::GRPC_MAX_MESSAGE_SIZE;
-use crate::storage::{compute_crc32c, ShardStorage, ShardWriter};
+use crate::storage::{compute_crc32c, ShardStorage};
+
+/// Number of parallel range requests for GCS downloads (can be overridden via env var)
+const DEFAULT_GCS_PARALLEL_RANGES: usize = 8;
 
 /// Type alias for the gRPC client used for peer transfers
 pub type PeerClient = FileTransferClient<Channel>;
@@ -254,6 +259,151 @@ impl Downloader {
         Ok(true)
     }
 
+    /// Download a shard from GCS using parallel range requests
+    /// This downloads N ranges in parallel, collects them in memory, verifies SHA256,
+    /// then writes to disk. Much faster than single-stream for high-bandwidth connections.
+    pub async fn download_shard_from_gcs_parallel<F, Fut>(
+        &self,
+        job_id: Uuid,
+        gcs_base_path: &str,
+        shard_path: &str,
+        shard_id: i32,
+        shard_size: u64,
+        on_progress: F,
+    ) -> anyhow::Result<bool>
+    where
+        F: Fn(u64, u64, Option<u64>) -> Fut + Send + Sync,
+        Fut: Future<Output = ()> + Send,
+    {
+        let (bucket, object_path) = parse_gcs_path(gcs_base_path)?;
+        let shard_object = format!("{}/{}", object_path, shard_path);
+
+        // Get parallelism from env var or use default
+        let num_ranges = std::env::var("GCS_PARALLEL_RANGES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(DEFAULT_GCS_PARALLEL_RANGES);
+
+        tracing::info!(
+            "Downloading shard {} from GCS (parallel, {} ranges): gs://{}/{}",
+            shard_id, num_ranges, bucket, shard_object
+        );
+
+        let download_start = std::time::Instant::now();
+
+        // Get the object store
+        let store = self.get_store(bucket).await?;
+        let path = ObjectPath::from(shard_object.as_str());
+
+        // Calculate ranges
+        let ranges = calculate_ranges(shard_size, num_ranges);
+
+        // Track bytes downloaded across all ranges for progress reporting
+        let bytes_downloaded = Arc::new(AtomicU64::new(0));
+
+        // Download all ranges in parallel
+        let handles: Vec<_> = ranges
+            .into_iter()
+            .enumerate()
+            .map(|(idx, range)| {
+                let store = store.clone();
+                let path = path.clone();
+                let bytes_downloaded = bytes_downloaded.clone();
+                let range_len = (range.end - range.start) as u64;
+                tokio::spawn(async move {
+                    let data = store.get_range(&path, range.clone()).await?;
+                    // Update progress when this range completes
+                    bytes_downloaded.fetch_add(range_len, Ordering::Relaxed);
+                    Ok::<_, anyhow::Error>((idx, data.to_vec()))
+                })
+            })
+            .collect();
+
+        // Collect results in order, reporting progress as each range completes
+        let mut range_results: Vec<Option<Vec<u8>>> = vec![None; handles.len()];
+        for handle in handles {
+            match handle.await {
+                Ok(Ok((idx, data))) => {
+                    range_results[idx] = Some(data);
+                    // Report progress after each range completes
+                    let current_bytes = bytes_downloaded.load(Ordering::Relaxed);
+                    on_progress(current_bytes, shard_size, None).await;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        "GCS range download error for shard {}: {} - will retry",
+                        shard_id, e
+                    );
+                    return Ok(false);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "GCS range download task panic for shard {}: {} - will retry",
+                        shard_id, e
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
+        // Concatenate all ranges
+        let mut all_data = Vec::with_capacity(shard_size as usize);
+        for (idx, range_data) in range_results.into_iter().enumerate() {
+            match range_data {
+                Some(data) => all_data.extend_from_slice(&data),
+                None => {
+                    tracing::warn!(
+                        "Missing range {} for shard {} - will retry",
+                        idx, shard_id
+                    );
+                    return Ok(false);
+                }
+            }
+        }
+
+        // Verify size
+        if all_data.len() as u64 != shard_size {
+            tracing::warn!(
+                "Shard {} size mismatch: expected {}, got {} - will retry",
+                shard_id, shard_size, all_data.len()
+            );
+            return Ok(false);
+        }
+
+        // Compute SHA256
+        let mut sha256_hasher = Sha256::new();
+        sha256_hasher.update(&all_data);
+        let computed_sha256 = hex::encode(sha256_hasher.finalize());
+
+        let download_elapsed = download_start.elapsed();
+        let throughput_mbps = (shard_size as f64 * 8.0) / download_elapsed.as_secs_f64() / 1_000_000.0;
+        tracing::info!(
+            "Shard {} SHA256: {} ({} bytes, {:.1} Mbit/s)",
+            shard_id, computed_sha256, shard_size, throughput_mbps
+        );
+
+        // Write to disk
+        let mut writer = self.storage.start_partial_shard_writer(job_id, shard_id).await?;
+        if let Err(e) = writer.write(&all_data).await {
+            tracing::warn!("Failed to write shard {} data: {} - will retry", shard_id, e);
+            self.storage.abort_partial(job_id, shard_id).await?;
+            return Ok(false);
+        }
+        if let Err(e) = writer.flush().await {
+            tracing::warn!("Failed to flush shard {}: {} - will retry", shard_id, e);
+            self.storage.abort_partial(job_id, shard_id).await?;
+            return Ok(false);
+        }
+
+        // Finalize the shard
+        self.storage.finalize_shard(job_id, shard_id).await?;
+
+        // Report final progress
+        on_progress(shard_size, shard_size, Some((shard_size as f64 / download_elapsed.as_secs_f64()) as u64)).await;
+
+        Ok(true)
+    }
+
     /// Download a shard from a peer via gRPC streaming
     /// The client should be created once and reused for multiple shards
     pub async fn download_shard_from_peer<F, Fut>(
@@ -443,4 +593,20 @@ fn parse_bandwidth_limit(s: &str) -> Option<u64> {
     };
 
     num_str.parse::<u64>().ok().map(|n| n * multiplier)
+}
+
+/// Calculate byte ranges for parallel download
+fn calculate_ranges(total_size: u64, num_ranges: usize) -> Vec<Range<usize>> {
+    let range_size = total_size / num_ranges as u64;
+    (0..num_ranges)
+        .map(|i| {
+            let start = i as u64 * range_size;
+            let end = if i == num_ranges - 1 {
+                total_size
+            } else {
+                (i + 1) as u64 * range_size
+            };
+            (start as usize)..(end as usize)
+        })
+        .collect()
 }

@@ -6,10 +6,10 @@ mod storage;
 
 use chrono::Utc;
 use common::TaskProgress;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use uuid::Uuid;
@@ -20,6 +20,80 @@ use downloader::Downloader;
 use file_service::{FileService, UploadTracker};
 use storage::ShardStorage;
 
+/// Rolling window throughput tracker
+/// Tracks cumulative bytes over time and calculates throughput from the window
+/// Caches last non-zero throughput to avoid showing 0 during brief idle periods
+struct ThroughputTracker {
+    /// (timestamp, cumulative_bytes) samples
+    samples: VecDeque<(Instant, u64)>,
+    /// Window duration in seconds
+    window_secs: f64,
+    /// Last non-zero throughput (to return during brief idle periods)
+    last_nonzero_throughput: Option<u64>,
+    /// When the last non-zero throughput was recorded
+    last_nonzero_at: Option<Instant>,
+}
+
+impl ThroughputTracker {
+    fn new(window_secs: f64) -> Self {
+        Self {
+            samples: VecDeque::new(),
+            window_secs,
+            last_nonzero_throughput: None,
+            last_nonzero_at: None,
+        }
+    }
+
+    /// Record current cumulative bytes
+    fn record(&mut self, bytes: u64) {
+        let now = Instant::now();
+        self.samples.push_back((now, bytes));
+        // Remove samples older than window
+        while let Some((ts, _)) = self.samples.front() {
+            if now.duration_since(*ts).as_secs_f64() > self.window_secs {
+                self.samples.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Get current throughput in bytes per second
+    /// Returns cached value during brief idle periods to avoid flickering
+    fn get_throughput(&mut self) -> Option<u64> {
+        if self.samples.len() < 2 {
+            return self.last_nonzero_throughput;
+        }
+        let (oldest_ts, oldest_bytes) = self.samples.front()?;
+        let (newest_ts, newest_bytes) = self.samples.back()?;
+
+        let time_delta = newest_ts.duration_since(*oldest_ts).as_secs_f64();
+        if time_delta < 0.1 {
+            return self.last_nonzero_throughput;
+        }
+
+        let bytes_delta = newest_bytes.saturating_sub(*oldest_bytes);
+        let throughput = (bytes_delta as f64 / time_delta) as u64;
+
+        if throughput > 0 {
+            // Update cached value
+            self.last_nonzero_throughput = Some(throughput);
+            self.last_nonzero_at = Some(*newest_ts);
+            Some(throughput)
+        } else if let (Some(cached), Some(cached_at)) = (self.last_nonzero_throughput, self.last_nonzero_at) {
+            // Return cached value if it's recent (within 2x window)
+            if newest_ts.duration_since(cached_at).as_secs_f64() < self.window_secs * 2.0 {
+                Some(cached)
+            } else {
+                // Cached value is stale, task is truly idle
+                None
+            }
+        } else {
+            None
+        }
+    }
+}
+
 struct TaskState {
     /// Last fully completed shard
     last_shard_completed: i32,
@@ -28,10 +102,14 @@ struct TaskState {
     bytes_downloaded_completed: u64,
     /// Bytes downloaded in current shard (transient, reset per shard)
     bytes_downloaded_current: u64,
+    /// Monotonically increasing total bytes (for throughput calculation, never resets)
+    total_bytes_downloaded: u64,
     /// Current shard being downloaded
     current_shard_id: Option<i32>,
     /// Progress within current shard (0-100%)
     current_shard_progress_pct: Option<f32>,
+    /// Rolling window download throughput tracker
+    download_throughput: ThroughputTracker,
 }
 
 #[tokio::main]
@@ -122,18 +200,30 @@ async fn main() -> anyhow::Result<()> {
         loop {
             interval.tick().await;
 
-            let states = heartbeat_states.read().await;
+            // Need write access to update throughput trackers
+            let mut states = heartbeat_states.write().await;
             let uploads = heartbeat_upload_tracker.read().await;
             let progress: Vec<TaskProgress> = states
-                .iter()
-                .map(|(job_id, state)| TaskProgress {
-                    deployment_job_id: *job_id,
-                    last_shard_id_completed: state.last_shard_completed,
-                    completed_at: if state.completed { Some(Utc::now()) } else { None },
-                    bytes_downloaded: state.bytes_downloaded_completed + state.bytes_downloaded_current,
-                    bytes_uploaded: *uploads.get(job_id).unwrap_or(&0),
-                    current_shard_id: state.current_shard_id,
-                    current_shard_progress_pct: state.current_shard_progress_pct,
+                .iter_mut()
+                .map(|(job_id, state)| {
+                    // Use monotonic counter for throughput (never resets between shards)
+                    state.download_throughput.record(state.total_bytes_downloaded);
+                    let download_throughput_bps = state.download_throughput.get_throughput();
+
+                    // Use completed + current for reporting total bytes
+                    let bytes_downloaded = state.bytes_downloaded_completed + state.bytes_downloaded_current;
+
+                    TaskProgress {
+                        deployment_job_id: *job_id,
+                        last_shard_id_completed: state.last_shard_completed,
+                        completed_at: if state.completed { Some(Utc::now()) } else { None },
+                        bytes_downloaded,
+                        bytes_uploaded: *uploads.get(job_id).unwrap_or(&0),
+                        download_throughput_bps,
+                        upload_throughput_bps: None, // TODO: track upload throughput similarly
+                        current_shard_id: state.current_shard_id,
+                        current_shard_progress_pct: state.current_shard_progress_pct,
+                    }
                 })
                 .collect();
             drop(states);
@@ -248,8 +338,10 @@ async fn main() -> anyhow::Result<()> {
                     completed: false,
                     bytes_downloaded_completed: 0,
                     bytes_downloaded_current: 0,
+                    total_bytes_downloaded: 0,
                     current_shard_id: None,
                     current_shard_progress_pct: None,
+                    download_throughput: ThroughputTracker::new(5.0), // 5 second rolling window
                 });
             }
 
@@ -317,6 +409,8 @@ async fn main() -> anyhow::Result<()> {
                         if let Some(state) = states.get_mut(&job_id) {
                             // Store current shard's cumulative progress (not a delta)
                             state.bytes_downloaded_current = bytes_in_shard;
+                            // Update monotonic counter (for throughput calculation)
+                            state.total_bytes_downloaded = state.bytes_downloaded_completed + bytes_in_shard;
                             // Calculate progress within shard as percentage
                             let progress_pct = if total_bytes > 0 {
                                 (bytes_in_shard as f32 / total_bytes as f32) * 100.0
@@ -341,16 +435,31 @@ async fn main() -> anyhow::Result<()> {
                 // Download the shard
                 let result = match upstream.upstream_type {
                     UpstreamType::Gcs => {
-                        downloader
-                            .download_shard_from_gcs(
-                                job_id,
-                                gcs_base_path,
-                                shard_path,
-                                shard_id,
-                                shard_size,
-                                progress_callback,
-                            )
-                            .await
+                        // Use parallel range requests for production GCS (much faster)
+                        // Fall back to single-stream for emulator (may not support ranges well)
+                        if std::env::var("STORAGE_EMULATOR_HOST").is_ok() {
+                            downloader
+                                .download_shard_from_gcs(
+                                    job_id,
+                                    gcs_base_path,
+                                    shard_path,
+                                    shard_id,
+                                    shard_size,
+                                    progress_callback,
+                                )
+                                .await
+                        } else {
+                            downloader
+                                .download_shard_from_gcs_parallel(
+                                    job_id,
+                                    gcs_base_path,
+                                    shard_path,
+                                    shard_id,
+                                    shard_size,
+                                    progress_callback,
+                                )
+                                .await
+                        }
                     }
                     UpstreamType::Peer => {
                         downloader

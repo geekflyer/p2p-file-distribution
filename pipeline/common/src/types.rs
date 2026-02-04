@@ -175,6 +175,12 @@ pub struct TaskProgress {
     pub bytes_downloaded: u64,
     /// Cumulative bytes uploaded (served to peers) for this task
     pub bytes_uploaded: u64,
+    /// Download throughput in bytes per second (calculated by server over rolling window)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_throughput_bps: Option<u64>,
+    /// Upload throughput in bytes per second (calculated by server over rolling window)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_throughput_bps: Option<u64>,
     /// Current shard being downloaded (for UI display, not persisted)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_shard_id: Option<i32>,

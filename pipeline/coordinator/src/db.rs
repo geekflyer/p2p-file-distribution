@@ -90,6 +90,18 @@ async fn init_db(pool: &DbPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Migration: Add throughput columns (reported by server, not calculated)
+    // These columns store the server-calculated throughput directly
+    sqlx::query("ALTER TABLE server_model_deployment_tasks ADD COLUMN download_throughput_bps INTEGER")
+        .execute(pool)
+        .await
+        .ok(); // Ignore error if column already exists
+
+    sqlx::query("ALTER TABLE server_model_deployment_tasks ADD COLUMN upload_throughput_bps INTEGER")
+        .execute(pool)
+        .await
+        .ok(); // Ignore error if column already exists
+
     Ok(())
 }
 
@@ -291,14 +303,11 @@ pub async fn get_job_server_progress(
     pool: &DbPool,
     job_id: Uuid,
 ) -> Result<Vec<ServerTaskProgress>, sqlx::Error> {
-    // Query includes fields for throughput calculation
-    let rows = sqlx::query_as::<_, (String, i32, Option<i32>, Option<f64>, Option<i64>, Option<String>, Option<i64>, Option<String>, Option<i64>, Option<String>, Option<i64>, Option<String>, String, String)>(
+    // Query returns server-reported throughput directly (no calculation needed)
+    let rows = sqlx::query_as::<_, (String, i32, Option<i32>, Option<f64>, Option<i64>, Option<i64>, String, String)>(
         r#"
         SELECT t.server_address, t.last_shard_id_completed, t.current_shard_id, t.current_shard_progress_pct,
-               t.prev_bytes_downloaded, t.prev_bytes_downloaded_at,
-               t.now_bytes_downloaded, t.now_bytes_downloaded_at,
-               t.prev_bytes_uploaded, t.prev_bytes_uploaded_at,
-               t.now_bytes_uploaded, t.now_bytes_uploaded_at,
+               t.download_throughput_bps, t.upload_throughput_bps,
                t.status, COALESCE(s.status, 'unhealthy') as server_status
         FROM server_model_deployment_tasks t
         LEFT JOIN servers s ON t.server_address = s.server_address
@@ -313,55 +322,20 @@ pub async fn get_job_server_progress(
     Ok(rows
         .into_iter()
         .map(|(server_address, last_shard_id_completed, current_shard_id, current_shard_progress_pct,
-               prev_bytes_dl, prev_bytes_dl_at, now_bytes_dl, now_bytes_dl_at,
-               prev_bytes_ul, prev_bytes_ul_at, now_bytes_ul, now_bytes_ul_at,
-               status, server_status)| {
-            // Calculate download throughput
-            let download_throughput_bps = calculate_throughput(
-                prev_bytes_dl, prev_bytes_dl_at.as_deref(),
-                now_bytes_dl, now_bytes_dl_at.as_deref(),
-            );
-            // Calculate upload throughput
-            let upload_throughput_bps = calculate_throughput(
-                prev_bytes_ul, prev_bytes_ul_at.as_deref(),
-                now_bytes_ul, now_bytes_ul_at.as_deref(),
-            );
-
+               download_throughput_bps, upload_throughput_bps, status, server_status)| {
             ServerTaskProgress {
                 server_address,
                 last_shard_id_completed,
                 status: status.parse().unwrap_or(TaskStatus::Failed),
                 server_status: server_status.parse().unwrap_or(ServerStatus::Unhealthy),
                 upstream: None,
-                download_throughput_bps,
-                upload_throughput_bps,
+                download_throughput_bps: download_throughput_bps.map(|v| v as u64),
+                upload_throughput_bps: upload_throughput_bps.map(|v| v as u64),
                 current_shard_id,
                 current_shard_progress_pct: current_shard_progress_pct.map(|p| p as f32),
             }
         })
         .collect())
-}
-
-/// Calculate throughput from prev/now byte counts and timestamps
-fn calculate_throughput(
-    prev_bytes: Option<i64>,
-    prev_at: Option<&str>,
-    now_bytes: Option<i64>,
-    now_at: Option<&str>,
-) -> Option<u64> {
-    let prev_bytes = prev_bytes?;
-    let now_bytes = now_bytes?;
-    let prev_at = parse_datetime(prev_at?)?;
-    let now_at = parse_datetime(now_at?)?;
-
-    let bytes_delta = now_bytes.saturating_sub(prev_bytes);
-    let time_delta_secs = (now_at - prev_at).num_milliseconds() as f64 / 1000.0;
-
-    if time_delta_secs > 0.0 && bytes_delta > 0 {
-        Some((bytes_delta as f64 / time_delta_secs) as u64)
-    } else {
-        None
-    }
 }
 
 // ============ Task Operations ============
@@ -400,7 +374,7 @@ pub async fn get_server_tasks(
 
 /// Update task progress - only writes last_shard_id_completed when shard completes
 /// Always updates current progress for UI display
-/// Shifts now_* values to prev_* before updating with new values
+/// Stores server-reported throughput directly (no longer calculated from deltas)
 pub async fn update_task_progress(
     pool: &DbPool,
     server_address: &str,
@@ -411,10 +385,12 @@ pub async fn update_task_progress(
     completed: bool,
     bytes_downloaded: u64,
     bytes_uploaded: u64,
+    download_throughput_bps: Option<u64>,
+    upload_throughput_bps: Option<u64>,
 ) -> Result<(), sqlx::Error> {
     let status = if completed { "completed" } else { "in_progress" };
 
-    // Shift now_* to prev_*, then update now_* with new values
+    // Store server-reported throughput directly
     // Only update tasks that are not in a terminal state (cancelled)
     sqlx::query(
         r#"
@@ -423,16 +399,12 @@ pub async fn update_task_progress(
             current_shard_id = $2,
             current_shard_progress_pct = $3,
             status = $4,
-            prev_bytes_downloaded = now_bytes_downloaded,
-            prev_bytes_downloaded_at = now_bytes_downloaded_at,
             now_bytes_downloaded = $5,
-            now_bytes_downloaded_at = datetime('now'),
-            prev_bytes_uploaded = now_bytes_uploaded,
-            prev_bytes_uploaded_at = now_bytes_uploaded_at,
             now_bytes_uploaded = $6,
-            now_bytes_uploaded_at = datetime('now'),
+            download_throughput_bps = $7,
+            upload_throughput_bps = $8,
             updated_at = datetime('now')
-        WHERE server_address = $7 AND deployment_job_id = $8
+        WHERE server_address = $9 AND deployment_job_id = $10
           AND status NOT IN ('cancelled')
         "#,
     )
@@ -442,6 +414,8 @@ pub async fn update_task_progress(
     .bind(status)
     .bind(bytes_downloaded as i64)
     .bind(bytes_uploaded as i64)
+    .bind(download_throughput_bps.map(|v| v as i64))
+    .bind(upload_throughput_bps.map(|v| v as i64))
     .bind(server_address)
     .bind(job_id.to_string())
     .execute(pool)
