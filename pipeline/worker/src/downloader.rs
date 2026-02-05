@@ -11,11 +11,25 @@ use uuid::Uuid;
 
 use crate::storage::{compute_crc32c, ChunkStorage};
 
-/// Number of chunks to batch per GCS request (~256MB with 64MB chunks)
-const GCS_BATCH_CHUNKS: usize = 4;
+/// Default number of chunks to batch per GCS request
+const DEFAULT_GCS_BATCH_CHUNKS: usize = 1;
 
-/// Number of parallel GCS downloads (reduced to limit memory usage)
-const GCS_PARALLEL_DOWNLOADS: usize = 4;
+/// Default number of parallel GCS downloads
+const DEFAULT_GCS_PARALLEL_DOWNLOADS: usize = 4;
+
+fn get_gcs_batch_chunks() -> usize {
+    std::env::var("GCS_BATCH_CHUNKS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_GCS_BATCH_CHUNKS)
+}
+
+fn get_gcs_parallel_downloads() -> usize {
+    std::env::var("GCS_PARALLEL_DOWNLOADS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_GCS_PARALLEL_DOWNLOADS)
+}
 
 pub struct Downloader {
     storage: Arc<ChunkStorage>,
@@ -105,9 +119,12 @@ impl Downloader {
     {
         let (bucket, object) = parse_gcs_path(gcs_path)?;
 
+        let gcs_parallel = get_gcs_parallel_downloads();
+        let gcs_batch = get_gcs_batch_chunks();
+
         tracing::info!(
-            "Downloading chunks {}-{} from GCS: gs://{}/{} ({} parallel)",
-            start_chunk, total_chunks - 1, bucket, object, GCS_PARALLEL_DOWNLOADS
+            "Downloading chunks {}-{} from GCS: gs://{}/{} ({} parallel, {} chunks/batch)",
+            start_chunk, total_chunks - 1, bucket, object, gcs_parallel, gcs_batch
         );
 
         let download_start = std::time::Instant::now();
@@ -116,7 +133,7 @@ impl Downloader {
         let mut batches: Vec<(i32, i32)> = Vec::new();
         let mut batch_idx = start_chunk;
         while batch_idx < total_chunks {
-            let batch_end = std::cmp::min(batch_idx + GCS_BATCH_CHUNKS as i32, total_chunks);
+            let batch_end = std::cmp::min(batch_idx + gcs_batch as i32, total_chunks);
             batches.push((batch_idx, batch_end));
             batch_idx = batch_end;
         }
@@ -125,10 +142,10 @@ impl Downloader {
         let emulator_url = std::env::var("STORAGE_EMULATOR_HOST").ok();
 
         // Channel for completed batches: (batch_start, data)
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<(i32, Vec<u8>)>(GCS_PARALLEL_DOWNLOADS * 2);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(i32, Vec<u8>)>(gcs_parallel * 2);
 
         // Semaphore to limit concurrent downloads
-        let semaphore = Arc::new(Semaphore::new(GCS_PARALLEL_DOWNLOADS));
+        let semaphore = Arc::new(Semaphore::new(gcs_parallel));
 
         // Spawn download tasks
         for (batch_start, batch_end) in batches.iter().copied() {

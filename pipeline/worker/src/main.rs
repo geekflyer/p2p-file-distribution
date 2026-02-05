@@ -13,10 +13,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-/// Get disk stats for the root filesystem (total bytes, used bytes)
-fn get_disk_stats(_data_dir: &std::path::Path) -> Option<(u64, u64)> {
-    // Get disk stats from root filesystem to represent whole VM disk
-    match statvfs("/") {
+/// Get disk stats for the data directory filesystem (total bytes, used bytes)
+fn get_disk_stats(data_dir: &std::path::Path) -> Option<(u64, u64)> {
+    // Get disk stats from the data_dir filesystem (may be local SSD or boot disk)
+    match statvfs(data_dir) {
         Ok(stat) => {
             let block_size = stat.block_size() as u64;
             let total_blocks = stat.blocks() as u64;
