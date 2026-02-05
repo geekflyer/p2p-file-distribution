@@ -145,7 +145,7 @@ pub struct FileDistribution {
     pub gcs_path: String,
     pub total_chunks: i32,
     pub total_size: u64,
-    pub chunk_size: u64,
+    pub chunk_size_bytes: u64,
     pub file_crc32c: String,
     pub status: DistributionStatus,
 }
@@ -157,7 +157,7 @@ pub struct DistributionTask {
     pub task_id: String,
     pub file_id: Uuid,
     pub total_chunks: i32,
-    pub chunk_size: u64,
+    pub chunk_size_bytes: u64,
     pub total_file_size_bytes: u64,
     pub crc32c: String,
     pub upstream: Upstream,
@@ -218,9 +218,9 @@ pub struct CheckInResponse {
 pub struct CreateDistributionRequest {
     /// Path to the file in GCS (e.g., gs://bucket/path/model.bin)
     pub gcs_path: String,
-    /// Optional chunk size override (default 64MB)
+    /// Optional chunk size override in bytes (default 64MB)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub chunk_size: Option<u64>,
+    pub chunk_size_bytes: Option<u64>,
 }
 
 /// Create distribution response

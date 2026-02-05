@@ -109,7 +109,7 @@ impl Downloader {
         gcs_path: &str,
         start_chunk: i32,
         total_chunks: i32,
-        chunk_size: u64,
+        chunk_size_bytes: u64,
         total_size: u64,
         on_progress: F,
     ) -> anyhow::Result<bool>
@@ -160,11 +160,11 @@ impl Downloader {
                 None
             };
 
-            let start_byte = batch_start as u64 * chunk_size;
+            let start_byte = batch_start as u64 * chunk_size_bytes;
             let end_byte = if batch_end == total_chunks {
                 total_size
             } else {
-                batch_end as u64 * chunk_size
+                batch_end as u64 * chunk_size_bytes
             };
 
             tokio::spawn(async move {
@@ -216,7 +216,7 @@ impl Downloader {
                     .unwrap();
 
                 total_bytes_downloaded += self.write_batch(
-                    file_id, batch_start, batch_end, total_chunks, chunk_size, &data,
+                    file_id, batch_start, batch_end, total_chunks, chunk_size_bytes, &data,
                     total_bytes_downloaded, &download_start, &on_progress
                 ).await?;
 
@@ -230,7 +230,7 @@ impl Downloader {
                         .unwrap();
 
                     total_bytes_downloaded += self.write_batch(
-                        file_id, next_batch_start, batch_end, total_chunks, chunk_size, &buffered_data,
+                        file_id, next_batch_start, batch_end, total_chunks, chunk_size_bytes, &buffered_data,
                         total_bytes_downloaded, &download_start, &on_progress
                     ).await?;
 
@@ -274,7 +274,7 @@ impl Downloader {
         batch_start: i32,
         batch_end: i32,
         total_chunks: i32,
-        chunk_size: u64,
+        chunk_size_bytes: u64,
         data: &[u8],
         bytes_so_far: u64,
         download_start: &std::time::Instant,
@@ -287,11 +287,11 @@ impl Downloader {
         let mut bytes_written = 0u64;
 
         for chunk_id in batch_start..batch_end {
-            let offset_in_batch = ((chunk_id - batch_start) as u64 * chunk_size) as usize;
+            let offset_in_batch = ((chunk_id - batch_start) as u64 * chunk_size_bytes) as usize;
             let chunk_end_offset = if chunk_id == total_chunks - 1 {
                 data.len()
             } else {
-                std::cmp::min(offset_in_batch + chunk_size as usize, data.len())
+                std::cmp::min(offset_in_batch + chunk_size_bytes as usize, data.len())
             };
 
             let chunk_data = &data[offset_in_batch..chunk_end_offset];
@@ -328,7 +328,7 @@ impl Downloader {
         file_id: Uuid,
         start_from_chunk: i32,
         total_chunks: i32,
-        chunk_size: u64,
+        chunk_size_bytes: u64,
         total_size: u64,
         on_progress: F,
     ) -> anyhow::Result<bool>
@@ -381,17 +381,17 @@ impl Downloader {
             let size = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
 
             // Validate size
-            let expected_chunk_size = if chunk_id == total_chunks - 1 {
-                let remainder = total_size % chunk_size;
-                if remainder == 0 { chunk_size } else { remainder }
+            let expected_chunk_size_bytes = if chunk_id == total_chunks - 1 {
+                let remainder = total_size % chunk_size_bytes;
+                if remainder == 0 { chunk_size_bytes } else { remainder }
             } else {
-                chunk_size
+                chunk_size_bytes
             };
 
-            if size as u64 != expected_chunk_size {
+            if size as u64 != expected_chunk_size_bytes {
                 tracing::warn!(
                     "Chunk {} size mismatch: expected {}, got {}",
-                    chunk_id, expected_chunk_size, size
+                    chunk_id, expected_chunk_size_bytes, size
                 );
                 return Ok(false);
             }

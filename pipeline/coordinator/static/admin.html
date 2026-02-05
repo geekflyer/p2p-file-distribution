@@ -511,7 +511,7 @@
 
                 const totalChunks = details.distribution.totalChunks;
                 const totalSize = details.distribution.totalSize;
-                const chunkSize = details.distribution.chunkSize;
+                const chunkSizeBytes = details.distribution.chunkSizeBytes;
                 const tbody = document.querySelector('#distributionProgressTable tbody');
 
                 // Calculate overall progress
@@ -522,7 +522,7 @@
                 // Calculate total bytes transferred
                 const totalBytesTransferred = details.workerProgress.reduce((sum, p) => {
                     const chunksComplete = p.lastChunkIdCompleted + 1;
-                    return sum + (chunksComplete * chunkSize);
+                    return sum + (chunksComplete * chunkSizeBytes);
                 }, 0);
                 const totalExpectedBytes = details.workerProgress.length * totalSize;
 
@@ -534,7 +534,7 @@
                 const avgBytesComplete = workerCount > 0
                     ? details.workerProgress.reduce((sum, p) => {
                         const chunksComplete = p.lastChunkIdCompleted + 1;
-                        return sum + Math.min(chunksComplete * chunkSize, totalSize);
+                        return sum + Math.min(chunksComplete * chunkSizeBytes, totalSize);
                     }, 0) / workerCount
                     : 0;
                 const avgProgress = totalSize > 0 ? (avgBytesComplete / totalSize * 100).toFixed(1) : 0;
@@ -542,7 +542,7 @@
                 document.getElementById('distributionSummary').innerHTML = `
                     <span><strong>Elapsed:</strong> ${formatElapsed(details.distribution.createdAt, details.distribution.updatedAt, details.distribution.status)}</span>
                     <span><strong>Total Size:</strong> ${formatBytes(totalSize)}</span>
-                    <span><strong>Chunk Size:</strong> ${formatBytes(chunkSize)}</span>
+                    <span><strong>Chunk Size:</strong> ${formatBytes(chunkSizeBytes)}</span>
                     <span><strong>Chunks:</strong> ${totalChunks}</span>
                     <span><strong>Avg Progress:</strong> ${formatBytes(avgBytesComplete)} / ${formatBytes(totalSize)} (${avgProgress}%)</span>
                 `;
@@ -562,7 +562,7 @@
                 tbody.innerHTML = details.workerProgress.map(p => {
                     const chunksComplete = p.lastChunkIdCompleted + 1;
                     const progress = totalChunks > 0 ? (chunksComplete / totalChunks * 100).toFixed(1) : 0;
-                    const bytesComplete = Math.min(chunksComplete * chunkSize, totalSize);
+                    const bytesComplete = Math.min(chunksComplete * chunkSizeBytes, totalSize);
 
                     // Use calculated throughputs (check for null, not falsy, since 0 is valid)
                     const downloadThroughput = p.downloadThroughputBps != null ? formatThroughput(p.downloadThroughputBps) : '-';

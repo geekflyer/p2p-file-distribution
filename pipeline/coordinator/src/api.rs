@@ -118,7 +118,7 @@ pub async fn create_distribution(
     Json(request): Json<CreateDistributionRequest>,
 ) -> impl IntoResponse {
     // Get chunk size (default 64MB)
-    let chunk_size = request.chunk_size.unwrap_or(DEFAULT_CHUNK_SIZE);
+    let chunk_size_bytes = request.chunk_size_bytes.unwrap_or(DEFAULT_CHUNK_SIZE);
 
     // Fetch GCS metadata to get file size and CRC32C
     let (total_size, file_crc32c) = match fetch_gcs_metadata(&request.gcs_path).await {
@@ -137,8 +137,8 @@ pub async fn create_distribution(
         "Creating distribution for {} ({} bytes, {} chunks of {} bytes, CRC32C: {})",
         request.gcs_path,
         total_size,
-        (total_size + chunk_size - 1) / chunk_size,
-        chunk_size,
+        (total_size + chunk_size_bytes - 1) / chunk_size_bytes,
+        chunk_size_bytes,
         file_crc32c
     );
 
@@ -146,7 +146,7 @@ pub async fn create_distribution(
         &state.pool,
         &request.gcs_path,
         total_size,
-        chunk_size,
+        chunk_size_bytes,
         &file_crc32c,
     )
     .await

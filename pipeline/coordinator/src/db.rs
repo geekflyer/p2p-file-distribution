@@ -47,7 +47,7 @@ async fn init_db(pool: &DbPool) -> Result<(), sqlx::Error> {
             gcs_path TEXT NOT NULL,
             total_chunks INTEGER NOT NULL DEFAULT 0,
             total_size INTEGER NOT NULL DEFAULT 0,
-            chunk_size INTEGER NOT NULL DEFAULT 0,
+            chunk_size_bytes INTEGER NOT NULL DEFAULT 0,
             file_crc32c TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'created',
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -217,15 +217,15 @@ pub async fn create_distribution(
     pool: &DbPool,
     gcs_path: &str,
     total_size: u64,
-    chunk_size: u64,
+    chunk_size_bytes: u64,
     file_crc32c: &str,
 ) -> Result<Uuid, sqlx::Error> {
     let file_id = Uuid::new_v4();
-    let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as i32;
+    let total_chunks = ((total_size + chunk_size_bytes - 1) / chunk_size_bytes) as i32;
 
     sqlx::query(
         r#"
-        INSERT INTO file_distributions (file_id, gcs_path, total_chunks, total_size, chunk_size, file_crc32c, status, created_at, updated_at)
+        INSERT INTO file_distributions (file_id, gcs_path, total_chunks, total_size, chunk_size_bytes, file_crc32c, status, created_at, updated_at)
         VALUES ($1, $2, $3, $4, $5, $6, 'created', datetime('now'), datetime('now'))
         "#,
     )
@@ -233,7 +233,7 @@ pub async fn create_distribution(
     .bind(gcs_path)
     .bind(total_chunks)
     .bind(total_size as i64)
-    .bind(chunk_size as i64)
+    .bind(chunk_size_bytes as i64)
     .bind(file_crc32c)
     .execute(pool)
     .await?;
@@ -257,7 +257,7 @@ pub async fn create_distribution(
 pub async fn get_all_distributions(pool: &DbPool) -> Result<Vec<FileDistribution>, sqlx::Error> {
     let rows = sqlx::query_as::<_, (String, String, String, String, i32, i64, i64, String, String)>(
         r#"
-        SELECT file_id, created_at, updated_at, gcs_path, total_chunks, total_size, chunk_size, COALESCE(file_crc32c, '') as file_crc32c, status
+        SELECT file_id, created_at, updated_at, gcs_path, total_chunks, total_size, chunk_size_bytes, COALESCE(file_crc32c, '') as file_crc32c, status
         FROM file_distributions
         ORDER BY created_at DESC
         "#,
@@ -268,7 +268,7 @@ pub async fn get_all_distributions(pool: &DbPool) -> Result<Vec<FileDistribution
     Ok(rows
         .into_iter()
         .filter_map(
-            |(file_id, created_at, updated_at, gcs_path, total_chunks, total_size, chunk_size, file_crc32c, status)| {
+            |(file_id, created_at, updated_at, gcs_path, total_chunks, total_size, chunk_size_bytes, file_crc32c, status)| {
                 let file_id = Uuid::parse_str(&file_id).ok()?;
                 let created_at = parse_datetime(&created_at)?;
                 let updated_at = parse_datetime(&updated_at)?;
@@ -279,7 +279,7 @@ pub async fn get_all_distributions(pool: &DbPool) -> Result<Vec<FileDistribution
                     gcs_path,
                     total_chunks,
                     total_size: total_size as u64,
-                    chunk_size: chunk_size as u64,
+                    chunk_size_bytes: chunk_size_bytes as u64,
                     file_crc32c,
                     status: status.parse().unwrap_or(DistributionStatus::Failed),
                 })
@@ -292,7 +292,7 @@ pub async fn get_all_distributions(pool: &DbPool) -> Result<Vec<FileDistribution
 pub async fn get_distribution(pool: &DbPool, file_id: Uuid) -> Result<Option<FileDistribution>, sqlx::Error> {
     let row = sqlx::query_as::<_, (String, String, String, String, i32, i64, i64, String, String)>(
         r#"
-        SELECT file_id, created_at, updated_at, gcs_path, total_chunks, total_size, chunk_size, COALESCE(file_crc32c, '') as file_crc32c, status
+        SELECT file_id, created_at, updated_at, gcs_path, total_chunks, total_size, chunk_size_bytes, COALESCE(file_crc32c, '') as file_crc32c, status
         FROM file_distributions
         WHERE file_id = $1
         "#,
@@ -302,7 +302,7 @@ pub async fn get_distribution(pool: &DbPool, file_id: Uuid) -> Result<Option<Fil
     .await?;
 
     Ok(row.and_then(
-        |(file_id, created_at, updated_at, gcs_path, total_chunks, total_size, chunk_size, file_crc32c, status)| {
+        |(file_id, created_at, updated_at, gcs_path, total_chunks, total_size, chunk_size_bytes, file_crc32c, status)| {
             let file_id = Uuid::parse_str(&file_id).ok()?;
             let created_at = parse_datetime(&created_at)?;
             let updated_at = parse_datetime(&updated_at)?;
@@ -313,7 +313,7 @@ pub async fn get_distribution(pool: &DbPool, file_id: Uuid) -> Result<Option<Fil
                 gcs_path,
                 total_chunks,
                 total_size: total_size as u64,
-                chunk_size: chunk_size as u64,
+                chunk_size_bytes: chunk_size_bytes as u64,
                 file_crc32c,
                 status: status.parse().unwrap_or(DistributionStatus::Failed),
             })
@@ -368,7 +368,7 @@ pub async fn get_worker_tasks(
 ) -> Result<Vec<(Uuid, String, i32, u64, u64, String)>, sqlx::Error> {
     let rows = sqlx::query_as::<_, (String, String, i32, i64, i64, String)>(
         r#"
-        SELECT d.file_id, d.gcs_path, d.total_chunks, d.total_size, d.chunk_size, COALESCE(d.file_crc32c, '') as file_crc32c
+        SELECT d.file_id, d.gcs_path, d.total_chunks, d.total_size, d.chunk_size_bytes, COALESCE(d.file_crc32c, '') as file_crc32c
         FROM distribution_tasks t
         JOIN file_distributions d ON t.file_id = d.file_id
         WHERE t.worker_address = $1 AND t.status NOT IN ('completed', 'cancelled')
@@ -381,9 +381,9 @@ pub async fn get_worker_tasks(
 
     Ok(rows
         .into_iter()
-        .filter_map(|(file_id, gcs_path, total_chunks, total_size, chunk_size, file_crc32c)| {
+        .filter_map(|(file_id, gcs_path, total_chunks, total_size, chunk_size_bytes, file_crc32c)| {
             let file_id = Uuid::parse_str(&file_id).ok()?;
-            Some((file_id, gcs_path, total_chunks, total_size as u64, chunk_size as u64, file_crc32c))
+            Some((file_id, gcs_path, total_chunks, total_size as u64, chunk_size_bytes as u64, file_crc32c))
         })
         .collect())
 }
@@ -396,7 +396,7 @@ pub async fn build_worker_tasks_with_upstream(
     let raw_tasks = get_worker_tasks(pool, worker_address).await?;
     let mut tasks = Vec::with_capacity(raw_tasks.len());
 
-    for (file_id, gcs_path, total_chunks, total_size, chunk_size, file_crc32c) in raw_tasks {
+    for (file_id, gcs_path, total_chunks, total_size, chunk_size_bytes, file_crc32c) in raw_tasks {
         // Get healthy workers ordered by progress for this distribution
         let workers = get_workers_by_distribution_progress(pool, file_id).await?;
 
@@ -426,7 +426,7 @@ pub async fn build_worker_tasks_with_upstream(
             task_id: format!("{}-{}", file_id, worker_address),
             file_id,
             total_chunks,
-            chunk_size,
+            chunk_size_bytes,
             total_file_size_bytes: total_size,
             crc32c: file_crc32c,
             upstream,

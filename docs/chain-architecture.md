@@ -60,7 +60,7 @@ Stateless service that:
     {
       "fileId": "uuid",
       "totalChunks": 16,
-      "chunkSize": 67108864,
+      "chunkSizeBytes": 67108864,
       "totalFileSizeBytes": 1073741824,
       "crc32c": "base64-encoded",
       "upstream": {

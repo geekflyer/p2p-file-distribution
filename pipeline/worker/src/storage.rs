@@ -64,7 +64,7 @@ impl ChunkStorage {
     }
 
     /// Initialize output file (create empty file, truncate any partial data to chunk boundary)
-    pub async fn initialize(&self, file_id: Uuid, chunk_size: u64) -> anyhow::Result<()> {
+    pub async fn initialize(&self, file_id: Uuid, chunk_size_bytes: u64) -> anyhow::Result<()> {
         self.ensure_file_dir(file_id).await?;
         let path = self.output_partial_path(file_id);
 
@@ -72,7 +72,7 @@ impl ChunkStorage {
             // File exists - truncate to last complete chunk boundary for crash recovery
             let meta = fs::metadata(&path).await?;
             let current_size = meta.len();
-            let complete_size = (current_size / chunk_size) * chunk_size;
+            let complete_size = (current_size / chunk_size_bytes) * chunk_size_bytes;
             if complete_size < current_size {
                 tracing::info!(
                     "Truncating partial chunk for file {}: {} -> {} bytes",
@@ -115,22 +115,22 @@ impl ChunkStorage {
     }
 
     /// Check if a chunk is complete (based on file size)
-    pub async fn is_chunk_complete(&self, file_id: Uuid, chunk_id: i32, chunk_size: u64, total_size: u64) -> bool {
+    pub async fn is_chunk_complete(&self, file_id: Uuid, chunk_id: i32, chunk_size_bytes: u64, total_size: u64) -> bool {
         let file_size = self.get_file_size(file_id).await;
         // Calculate where this chunk ends
-        let chunk_end = (chunk_id as u64 + 1) * chunk_size;
+        let chunk_end = (chunk_id as u64 + 1) * chunk_size_bytes;
         // For the last chunk, the end is total_size (which may be less than chunk boundary)
         let actual_chunk_end = std::cmp::min(chunk_end, total_size);
         file_size >= actual_chunk_end
     }
 
     /// Get last completed chunk based on file size
-    pub async fn get_last_completed_chunk(&self, file_id: Uuid, chunk_size: u64) -> i32 {
+    pub async fn get_last_completed_chunk(&self, file_id: Uuid, chunk_size_bytes: u64) -> i32 {
         let file_size = self.get_file_size(file_id).await;
-        if file_size == 0 || chunk_size == 0 {
+        if file_size == 0 || chunk_size_bytes == 0 {
             return -1;
         }
-        (file_size / chunk_size) as i32 - 1
+        (file_size / chunk_size_bytes) as i32 - 1
     }
 
     /// Finalize (rename partial to final)
@@ -250,17 +250,17 @@ impl ChunkStorage {
         &self,
         file_id: Uuid,
         chunk_id: i32,
-        chunk_size: u64,
+        chunk_size_bytes: u64,
         total_size: u64,
         total_chunks: i32,
     ) -> anyhow::Result<ChunkInfo> {
-        let offset = chunk_id as u64 * chunk_size;
+        let offset = chunk_id as u64 * chunk_size_bytes;
         let size = if chunk_id == total_chunks - 1 {
             // Last chunk may be smaller
-            let remainder = total_size % chunk_size;
-            if remainder == 0 { chunk_size as u32 } else { remainder as u32 }
+            let remainder = total_size % chunk_size_bytes;
+            if remainder == 0 { chunk_size_bytes as u32 } else { remainder as u32 }
         } else {
-            chunk_size as u32
+            chunk_size_bytes as u32
         };
 
         let crc32c = self.get_chunk_crc32c(file_id, chunk_id).await?;

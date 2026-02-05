@@ -341,7 +341,7 @@ async fn main() -> anyhow::Result<()> {
             {
                 let mut meta = chunk_meta.write().await;
                 meta.insert(file_id, ChunkMeta {
-                    chunk_size: task.chunk_size,
+                    chunk_size_bytes: task.chunk_size_bytes,
                     total_size: task.total_file_size_bytes,
                     total_chunks: task.total_chunks,
                 });
@@ -354,7 +354,7 @@ async fn main() -> anyhow::Result<()> {
                     Some(s) => s.last_chunk_completed + 1,
                     None => {
                         // On restart, check local storage for completed chunks
-                        storage.get_last_completed_chunk(file_id, task.chunk_size).await + 1
+                        storage.get_last_completed_chunk(file_id, task.chunk_size_bytes).await + 1
                     }
                 }
             };
@@ -378,14 +378,14 @@ async fn main() -> anyhow::Result<()> {
                 states.entry(file_id).or_insert(TaskState {
                     last_chunk_completed: start_from_chunk - 1,
                     completed: false,
-                    bytes_downloaded: (start_from_chunk as u64) * task.chunk_size,
+                    bytes_downloaded: (start_from_chunk as u64) * task.chunk_size_bytes,
                     download_throughput: ThroughputTracker::new(5.0),
                     upload_throughput: ThroughputTracker::new(5.0),
                 });
             }
 
             // Initialize output file if not already done
-            if let Err(e) = storage.initialize(file_id, task.chunk_size).await {
+            if let Err(e) = storage.initialize(file_id, task.chunk_size_bytes).await {
                 tracing::error!("Failed to initialize file for {}: {}", file_id, e);
                 continue;
             }
@@ -454,7 +454,7 @@ async fn run_download(
                     gcs_path,
                     start_from_chunk,
                     task.total_chunks,
-                    task.chunk_size,
+                    task.chunk_size_bytes,
                     task.total_file_size_bytes,
                     progress_callback,
                 )
@@ -467,7 +467,7 @@ async fn run_download(
                     file_id,
                     start_from_chunk,
                     task.total_chunks,
-                    task.chunk_size,
+                    task.chunk_size_bytes,
                     task.total_file_size_bytes,
                     progress_callback,
                 )
@@ -520,7 +520,7 @@ async fn run_download(
             tracing::warn!("Download verification failed for file {} - will retry", file_id);
 
             // Update state with what we completed
-            let last_completed = storage.get_last_completed_chunk(file_id, task.chunk_size).await;
+            let last_completed = storage.get_last_completed_chunk(file_id, task.chunk_size_bytes).await;
             let mut states = task_states.write().await;
             if let Some(state) = states.get_mut(&file_id) {
                 state.last_chunk_completed = last_completed;

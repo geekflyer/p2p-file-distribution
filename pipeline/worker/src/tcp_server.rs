@@ -11,7 +11,7 @@ use crate::storage::ChunkStorage;
 
 /// Chunk metadata needed for streaming
 pub struct ChunkMeta {
-    pub chunk_size: u64,
+    pub chunk_size_bytes: u64,
     pub total_size: u64,
     pub total_chunks: i32,
 }
@@ -82,7 +82,7 @@ async fn handle_connection(
         let metas = chunk_meta.read().await;
         match metas.get(&file_id) {
             Some(m) => ChunkMeta {
-                chunk_size: m.chunk_size,
+                chunk_size_bytes: m.chunk_size_bytes,
                 total_size: m.total_size,
                 total_chunks: m.total_chunks,
             },
@@ -118,14 +118,14 @@ async fn stream_chunks_sendfile(
     storage: Arc<ChunkStorage>,
     upload_tracker: UploadTracker,
 ) -> anyhow::Result<()> {
-    let chunk_size = meta.chunk_size;
+    let chunk_size_bytes = meta.chunk_size_bytes;
     let total_size = meta.total_size;
     let total_chunks = meta.total_chunks;
 
     // Wait for first chunk before opening file (file might not exist yet)
     let mut waited_ms: u64 = 0;
     while !storage
-        .is_chunk_complete(file_id, start_chunk, chunk_size, total_size)
+        .is_chunk_complete(file_id, start_chunk, chunk_size_bytes, total_size)
         .await
     {
         if waited_ms >= MAX_WAIT_MS {
@@ -147,7 +147,7 @@ async fn stream_chunks_sendfile(
         if chunk_id > start_chunk {
             let mut waited_ms: u64 = 0;
             while !storage
-                .is_chunk_complete(file_id, chunk_id, chunk_size, total_size)
+                .is_chunk_complete(file_id, chunk_id, chunk_size_bytes, total_size)
                 .await
             {
                 if waited_ms >= MAX_WAIT_MS {
@@ -164,7 +164,7 @@ async fn stream_chunks_sendfile(
 
         // Get chunk info (offset, size, crc32c)
         let chunk_info = match storage
-            .get_chunk_info(file_id, chunk_id, chunk_size, total_size, total_chunks)
+            .get_chunk_info(file_id, chunk_id, chunk_size_bytes, total_size, total_chunks)
             .await
         {
             Ok(info) => info,
