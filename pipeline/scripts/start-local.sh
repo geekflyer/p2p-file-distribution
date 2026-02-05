@@ -8,8 +8,8 @@ if [ -f .env.local ]; then
     export $(grep -v '^#' .env.local | xargs)
 fi
 
-# Number of servers to start (default: 20)
-NUM_SERVERS=${NUM_SERVERS:-20}
+# Number of workers to start (default: 20)
+NUM_WORKERS=${NUM_WORKERS:-20}
 
 echo "Starting local development environment..."
 
@@ -28,7 +28,7 @@ fi
 
 # Stop any existing processes
 pkill -f "target/release/coordinator" 2>/dev/null || true
-pkill -f "target/release/server" 2>/dev/null || true
+pkill -f "target/release/worker" 2>/dev/null || true
 sleep 1
 
 # Start coordinator
@@ -36,26 +36,26 @@ echo "Starting coordinator..."
 ./target/release/coordinator > /tmp/coordinator.log 2>&1 &
 sleep 1
 
-# Start servers
-echo "Starting $NUM_SERVERS servers..."
-for i in $(seq 1 $NUM_SERVERS); do
+# Start workers
+echo "Starting $NUM_WORKERS workers..."
+for i in $(seq 1 $NUM_WORKERS); do
     port=$((50050 + i))
     padded=$(printf "%02d" $i)
 
-    SERVER_ADDR="localhost:${port}" \
+    WORKER_ADDR="localhost:${port}" \
     GRPC_PORT="${port}" \
-    DATA_DIR="./data/servers/server${padded}" \
-    ./target/release/server > /tmp/server${i}.log 2>&1 &
+    DATA_DIR="./data/workers/worker${padded}" \
+    ./target/release/worker > /tmp/worker${i}.log 2>&1 &
 done
 
 sleep 2
 
 # Check status
-healthy=$(curl -s http://localhost:8080/admin/servers | jq '[.[] | select(.status=="healthy")] | length')
+healthy=$(curl -s http://localhost:8080/admin/workers | jq '[.[] | select(.status=="healthy")] | length')
 echo ""
 echo "Started successfully!"
 echo "  - Coordinator: http://localhost:8080"
-echo "  - Servers: $healthy healthy"
+echo "  - Workers: $healthy healthy"
 echo "  - Fake GCS: http://localhost:4443"
 echo ""
 echo "Bandwidth limits:"

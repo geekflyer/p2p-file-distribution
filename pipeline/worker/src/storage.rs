@@ -13,32 +13,32 @@ impl ChunkStorage {
         Self { data_dir }
     }
 
-    /// Get the job directory path
-    fn job_dir(&self, job_id: Uuid) -> PathBuf {
-        self.data_dir.join(job_id.to_string())
+    /// Get the file directory path
+    fn file_dir(&self, file_id: Uuid) -> PathBuf {
+        self.data_dir.join(file_id.to_string())
     }
 
-    /// Output file path for a job (partial during download)
-    fn output_partial_path(&self, job_id: Uuid) -> PathBuf {
-        self.job_dir(job_id).join("output.bin.partial")
+    /// Output file path (partial during download)
+    fn output_partial_path(&self, file_id: Uuid) -> PathBuf {
+        self.file_dir(file_id).join("output.bin.partial")
     }
 
-    /// Output file path for a job (final)
-    fn output_path(&self, job_id: Uuid) -> PathBuf {
-        self.job_dir(job_id).join("output.bin")
+    /// Output file path (final)
+    fn output_path(&self, file_id: Uuid) -> PathBuf {
+        self.file_dir(file_id).join("output.bin")
     }
 
-    /// Ensure job directory exists
-    async fn ensure_job_dir(&self, job_id: Uuid) -> anyhow::Result<()> {
-        let dir = self.job_dir(job_id);
+    /// Ensure file directory exists
+    async fn ensure_file_dir(&self, file_id: Uuid) -> anyhow::Result<()> {
+        let dir = self.file_dir(file_id);
         fs::create_dir_all(&dir).await?;
         Ok(())
     }
 
     /// Get file size of output file (partial or final)
-    async fn get_file_size(&self, job_id: Uuid) -> u64 {
-        let partial_path = self.output_partial_path(job_id);
-        let final_path = self.output_path(job_id);
+    async fn get_file_size(&self, file_id: Uuid) -> u64 {
+        let partial_path = self.output_partial_path(file_id);
+        let final_path = self.output_path(file_id);
 
         if let Ok(meta) = fs::metadata(&final_path).await {
             return meta.len();
@@ -49,18 +49,10 @@ impl ChunkStorage {
         0
     }
 
-    /// Check if the job is initialized (output file exists)
-    pub async fn is_initialized(&self, job_id: Uuid) -> bool {
-        let partial = self.output_partial_path(job_id);
-        let final_path = self.output_path(job_id);
-        fs::try_exists(&partial).await.unwrap_or(false) ||
-            fs::try_exists(&final_path).await.unwrap_or(false)
-    }
-
     /// Initialize output file (create empty file, truncate any partial data to chunk boundary)
-    pub async fn initialize(&self, job_id: Uuid, chunk_size: u64) -> anyhow::Result<()> {
-        self.ensure_job_dir(job_id).await?;
-        let path = self.output_partial_path(job_id);
+    pub async fn initialize(&self, file_id: Uuid, chunk_size: u64) -> anyhow::Result<()> {
+        self.ensure_file_dir(file_id).await?;
+        let path = self.output_partial_path(file_id);
 
         if fs::try_exists(&path).await.unwrap_or(false) {
             // File exists - truncate to last complete chunk boundary for crash recovery
@@ -69,8 +61,8 @@ impl ChunkStorage {
             let complete_size = (current_size / chunk_size) * chunk_size;
             if complete_size < current_size {
                 tracing::info!(
-                    "Truncating partial chunk for job {}: {} -> {} bytes",
-                    job_id, current_size, complete_size
+                    "Truncating partial chunk for file {}: {} -> {} bytes",
+                    file_id, current_size, complete_size
                 );
                 let file = OpenOptions::new().write(true).open(&path).await?;
                 file.set_len(complete_size).await?;
@@ -78,22 +70,22 @@ impl ChunkStorage {
         } else {
             // Create new empty file
             File::create(&path).await?;
-            tracing::info!("Created output file for job {}", job_id);
+            tracing::info!("Created output file for {}", file_id);
         }
         Ok(())
     }
 
     /// Append chunk to output file (sequential writes only)
-    pub async fn append_chunk(&self, job_id: Uuid, data: &[u8]) -> anyhow::Result<()> {
-        let partial_path = self.output_partial_path(job_id);
-        let final_path = self.output_path(job_id);
+    pub async fn append_chunk(&self, file_id: Uuid, data: &[u8]) -> anyhow::Result<()> {
+        let partial_path = self.output_partial_path(file_id);
+        let final_path = self.output_path(file_id);
 
         let path = if fs::try_exists(&partial_path).await.unwrap_or(false) {
             partial_path
         } else if fs::try_exists(&final_path).await.unwrap_or(false) {
             final_path
         } else {
-            anyhow::bail!("No output file exists for job {}", job_id);
+            anyhow::bail!("No output file exists for {}", file_id);
         };
 
         let mut file = OpenOptions::new()
@@ -109,8 +101,8 @@ impl ChunkStorage {
     }
 
     /// Check if a chunk is complete (based on file size)
-    pub async fn is_chunk_complete(&self, job_id: Uuid, chunk_id: i32, chunk_size: u64, total_size: u64) -> bool {
-        let file_size = self.get_file_size(job_id).await;
+    pub async fn is_chunk_complete(&self, file_id: Uuid, chunk_id: i32, chunk_size: u64, total_size: u64) -> bool {
+        let file_size = self.get_file_size(file_id).await;
         // Calculate where this chunk ends
         let chunk_end = (chunk_id as u64 + 1) * chunk_size;
         // For the last chunk, the end is total_size (which may be less than chunk boundary)
@@ -119,8 +111,8 @@ impl ChunkStorage {
     }
 
     /// Get last completed chunk based on file size
-    pub async fn get_last_completed_chunk(&self, job_id: Uuid, chunk_size: u64) -> i32 {
-        let file_size = self.get_file_size(job_id).await;
+    pub async fn get_last_completed_chunk(&self, file_id: Uuid, chunk_size: u64) -> i32 {
+        let file_size = self.get_file_size(file_id).await;
         if file_size == 0 || chunk_size == 0 {
             return -1;
         }
@@ -128,17 +120,17 @@ impl ChunkStorage {
     }
 
     /// Read range from output file (for P2P serving)
-    pub async fn read_range(&self, job_id: Uuid, offset: u64, length: usize) -> anyhow::Result<Vec<u8>> {
+    pub async fn read_range(&self, file_id: Uuid, offset: u64, length: usize) -> anyhow::Result<Vec<u8>> {
         // Try final file first, then partial
-        let final_path = self.output_path(job_id);
-        let partial_path = self.output_partial_path(job_id);
+        let final_path = self.output_path(file_id);
+        let partial_path = self.output_partial_path(file_id);
 
         let path = if fs::try_exists(&final_path).await.unwrap_or(false) {
             final_path
         } else if fs::try_exists(&partial_path).await.unwrap_or(false) {
             partial_path
         } else {
-            anyhow::bail!("No output file exists for job {}", job_id);
+            anyhow::bail!("No output file exists for {}", file_id);
         };
 
         let mut file = File::open(&path).await?;
@@ -151,29 +143,29 @@ impl ChunkStorage {
     }
 
     /// Finalize (rename partial to final)
-    pub async fn finalize(&self, job_id: Uuid) -> anyhow::Result<()> {
-        let partial_path = self.output_partial_path(job_id);
-        let final_path = self.output_path(job_id);
+    pub async fn finalize(&self, file_id: Uuid) -> anyhow::Result<()> {
+        let partial_path = self.output_partial_path(file_id);
+        let final_path = self.output_path(file_id);
 
         if fs::try_exists(&partial_path).await.unwrap_or(false) {
             fs::rename(&partial_path, &final_path).await?;
-            tracing::info!("Finalized output file for job {}", job_id);
+            tracing::info!("Finalized output file for {}", file_id);
         }
 
         Ok(())
     }
 
     /// Verify file CRC32C
-    pub async fn verify_crc32c(&self, job_id: Uuid, expected: &str) -> anyhow::Result<bool> {
+    pub async fn verify_crc32c(&self, file_id: Uuid, expected: &str) -> anyhow::Result<bool> {
         if expected.is_empty() {
             // No CRC32C to verify (e.g., emulator doesn't provide it)
-            tracing::warn!("No CRC32C to verify for job {}", job_id);
+            tracing::warn!("No CRC32C to verify for {}", file_id);
             return Ok(true);
         }
 
-        let path = self.output_path(job_id);
+        let path = self.output_path(file_id);
         if !fs::try_exists(&path).await.unwrap_or(false) {
-            anyhow::bail!("Output file not found for job {}", job_id);
+            anyhow::bail!("Output file not found for {}", file_id);
         }
 
         // Read file in chunks and compute CRC32C
@@ -208,23 +200,23 @@ impl ChunkStorage {
 
         let verified = hasher == expected_crc;
         if verified {
-            tracing::info!("CRC32C verified for job {} ({})", job_id, expected);
+            tracing::info!("CRC32C verified for {} ({})", file_id, expected);
         } else {
             tracing::error!(
-                "CRC32C mismatch for job {}: expected {:08x}, got {:08x}",
-                job_id, expected_crc, hasher
+                "CRC32C mismatch for {}: expected {:08x}, got {:08x}",
+                file_id, expected_crc, hasher
             );
         }
 
         Ok(verified)
     }
 
-    /// Delete all data for a job (used when job is purged)
-    pub async fn delete_job(&self, job_id: Uuid) -> anyhow::Result<()> {
-        let dir = self.job_dir(job_id);
+    /// Delete all data for a file (used when file is purged)
+    pub async fn delete_file(&self, file_id: Uuid) -> anyhow::Result<()> {
+        let dir = self.file_dir(file_id);
         if dir.exists() {
             fs::remove_dir_all(&dir).await?;
-            tracing::info!("Deleted data for job {}", job_id);
+            tracing::info!("Deleted data for {}", file_id);
         }
         Ok(())
     }

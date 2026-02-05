@@ -191,14 +191,14 @@
             font-size: 12px;
         }
 
-        .job-summary {
+        .distribution-summary {
             margin-bottom: 15px;
             padding: 10px;
             background: #f8f9fa;
             border-radius: 4px;
         }
 
-        .job-summary span {
+        .distribution-summary span {
             margin-right: 20px;
         }
 
@@ -261,36 +261,36 @@
         </div>
 
         <div class="tabs">
-            <button class="tab active" onclick="switchTab('jobs')">
-                Jobs <span class="tab-badge" id="jobsCount">0</span>
+            <button class="tab active" onclick="switchTab('distributions')">
+                Distributions <span class="tab-badge" id="distributionsCount">0</span>
             </button>
-            <button class="tab" onclick="switchTab('servers')">
-                Servers <span class="tab-badge" id="serversCount">0</span>
+            <button class="tab" onclick="switchTab('workers')">
+                Workers <span class="tab-badge" id="workersCount">0</span>
             </button>
         </div>
 
-        <!-- Jobs Tab -->
-        <div id="jobs-tab" class="tab-content active">
+        <!-- Distributions Tab -->
+        <div id="distributions-tab" class="tab-content active">
             <div class="card">
-                <h2>Create New Deployment Job</h2>
-                <form id="createJobForm">
+                <h2>Create New File Distribution</h2>
+                <form id="createDistributionForm">
                     <div class="form-group">
-                        <label for="gcsFilePath">GCS File Path</label>
-                        <input type="text" id="gcsFilePath" placeholder="gs://bucket/path/model.bin" required>
+                        <label for="gcsPath">GCS File Path</label>
+                        <input type="text" id="gcsPath" placeholder="gs://bucket/path/model.bin" required>
                         <small style="color: #666; display: block; margin-top: 4px;">Path to the file in GCS (will be
                             chunked on-the-fly)</small>
                     </div>
-                    <button type="submit">Create Job</button>
-                    <div id="createJobResult"></div>
+                    <button type="submit">Create Distribution</button>
+                    <div id="createDistributionResult"></div>
                 </form>
             </div>
 
             <div class="card">
-                <h2>Deployment Jobs</h2>
-                <table id="jobsTable">
+                <h2>File Distributions</h2>
+                <table id="distributionsTable">
                     <thead>
                         <tr>
-                            <th>Job ID</th>
+                            <th>File ID</th>
                             <th>GCS Path</th>
                             <th>Total Size</th>
                             <th>Chunks</th>
@@ -303,14 +303,14 @@
                 </table>
             </div>
 
-            <div class="card" id="jobDetailsCard" style="display: none;">
-                <h2>Job Details: <span id="selectedJobId"></span></h2>
-                <div class="job-summary" id="jobSummary"></div>
-                <table id="jobProgressTable">
+            <div class="card" id="distributionDetailsCard" style="display: none;">
+                <h2>Distribution Details: <span id="selectedFileId"></span></h2>
+                <div class="distribution-summary" id="distributionSummary"></div>
+                <table id="distributionProgressTable">
                     <thead>
                         <tr>
-                            <th>Server Address</th>
-                            <th>Server</th>
+                            <th>Worker Address</th>
+                            <th>Worker</th>
                             <th>Upstream</th>
                             <th>Task</th>
                             <th>Progress</th>
@@ -323,14 +323,14 @@
             </div>
         </div>
 
-        <!-- Servers Tab -->
-        <div id="servers-tab" class="tab-content">
+        <!-- Workers Tab -->
+        <div id="workers-tab" class="tab-content">
             <div class="card">
-                <h2>Servers</h2>
-                <table id="serversTable">
+                <h2>Workers</h2>
+                <table id="workersTable">
                     <thead>
                         <tr>
-                            <th>Server Address</th>
+                            <th>Worker Address</th>
                             <th>Status</th>
                             <th>Disk Usage</th>
                             <th>Last Heartbeat</th>
@@ -343,7 +343,7 @@
     </div>
 
     <script>
-        let currentJobId = null;
+        let currentFileId = null;
 
         function switchTab(tabName) {
             // Update tab buttons
@@ -389,158 +389,158 @@
             return `${seconds}s`;
         }
 
-        async function fetchServers() {
+        async function fetchWorkers() {
             try {
-                const res = await fetch('/admin/servers');
-                const servers = await res.json();
-                document.getElementById('serversCount').textContent = servers.length;
-                const tbody = document.querySelector('#serversTable tbody');
-                tbody.innerHTML = servers.map(s => {
+                const res = await fetch('/admin/workers');
+                const workers = await res.json();
+                document.getElementById('workersCount').textContent = workers.length;
+                const tbody = document.querySelector('#workersTable tbody');
+                tbody.innerHTML = workers.map(w => {
                     let diskInfo = '-';
-                    if (s.diskTotalBytes && s.diskUsedBytes) {
-                        const totalGB = (s.diskTotalBytes / 1e9).toFixed(1);
-                        const usedGB = (s.diskUsedBytes / 1e9).toFixed(1);
-                        const pct = ((s.diskUsedBytes / s.diskTotalBytes) * 100).toFixed(0);
+                    if (w.diskTotalBytes && w.diskUsedBytes) {
+                        const totalGB = (w.diskTotalBytes / 1e9).toFixed(1);
+                        const usedGB = (w.diskUsedBytes / 1e9).toFixed(1);
+                        const pct = ((w.diskUsedBytes / w.diskTotalBytes) * 100).toFixed(0);
                         diskInfo = `${usedGB} / ${totalGB} GB (${pct}%)`;
                     }
                     return `
                     <tr>
-                        <td>${s.serverAddress}</td>
-                        <td><span class="status ${s.status}">${s.status}</span></td>
+                        <td>${w.workerAddress}</td>
+                        <td><span class="status ${w.status}">${w.status}</span></td>
                         <td>${diskInfo}</td>
-                        <td>${new Date(s.lastHeartbeat).toLocaleString()}</td>
+                        <td>${new Date(w.lastHeartbeat).toLocaleString()}</td>
                     </tr>
                     `;
                 }).join('');
             } catch (e) {
-                console.error('Failed to fetch servers:', e);
+                console.error('Failed to fetch workers:', e);
             }
         }
 
-        async function fetchJobs() {
+        async function fetchDistributions() {
             try {
-                const res = await fetch('/admin/jobs');
-                const jobs = await res.json();
-                document.getElementById('jobsCount').textContent = jobs.length;
-                const tbody = document.querySelector('#jobsTable tbody');
-                tbody.innerHTML = jobs.map(j => {
-                    const isSelected = j.deploymentJobId === currentJobId;
-                    const canCancel = j.status === 'created' || j.status === 'in_progress';
-                    const canPurge = j.status === 'completed' || j.status === 'failed' || j.status === 'cancelled';
+                const res = await fetch('/admin/distributions');
+                const distributions = await res.json();
+                document.getElementById('distributionsCount').textContent = distributions.length;
+                const tbody = document.querySelector('#distributionsTable tbody');
+                tbody.innerHTML = distributions.map(d => {
+                    const isSelected = d.fileId === currentFileId;
+                    const canCancel = d.status === 'created' || d.status === 'in_progress';
+                    const canPurge = d.status === 'completed' || d.status === 'failed' || d.status === 'cancelled';
                     return `
                         <tr style="${isSelected ? 'background: #e3f2fd;' : ''}">
-                            <td>${j.deploymentJobId.substring(0, 8)}...</td>
-                            <td>${j.gcsFilePath}</td>
-                            <td>${formatBytes(j.totalSize)}</td>
-                            <td>${j.totalChunks}</td>
-                            <td><span class="status ${j.status}">${j.status}</span></td>
-                            <td>${new Date(j.createdAt).toLocaleString()}</td>
+                            <td>${d.fileId.substring(0, 8)}...</td>
+                            <td>${d.gcsPath}</td>
+                            <td>${formatBytes(d.totalSize)}</td>
+                            <td>${d.totalChunks}</td>
+                            <td><span class="status ${d.status}">${d.status}</span></td>
+                            <td>${new Date(d.createdAt).toLocaleString()}</td>
                             <td>
-                                <button class="btn-small" onclick="viewJobDetails('${j.deploymentJobId}')">${isSelected ? 'Viewing' : 'View'}</button>
-                                ${canCancel ? `<button class="btn-small btn-danger" onclick="cancelJob('${j.deploymentJobId}')">Cancel</button>` : ''}
-                                ${canPurge ? `<button class="btn-small btn-danger" onclick="purgeJob('${j.deploymentJobId}')">Purge</button>` : ''}
+                                <button class="btn-small" onclick="viewDistributionDetails('${d.fileId}')">${isSelected ? 'Viewing' : 'View'}</button>
+                                ${canCancel ? `<button class="btn-small btn-danger" onclick="cancelDistribution('${d.fileId}')">Cancel</button>` : ''}
+                                ${canPurge ? `<button class="btn-small btn-danger" onclick="purgeDistribution('${d.fileId}')">Purge</button>` : ''}
                             </td>
                         </tr>
                     `;
                 }).join('');
             } catch (e) {
-                console.error('Failed to fetch jobs:', e);
+                console.error('Failed to fetch distributions:', e);
             }
         }
 
-        async function viewJobDetails(jobId) {
-            currentJobId = jobId;
+        async function viewDistributionDetails(fileId) {
+            currentFileId = fileId;
 
             // Update URL without reloading
             const url = new URL(window.location);
-            url.searchParams.set('job', jobId);
+            url.searchParams.set('file', fileId);
             window.history.pushState({}, '', url);
 
-            await refreshJobDetails();
-            fetchJobs(); // Refresh to show selection
+            await refreshDistributionDetails();
+            fetchDistributions(); // Refresh to show selection
         }
 
-        async function cancelJob(jobId) {
-            if (!confirm('Are you sure you want to cancel this job? Servers will stop downloading.')) {
+        async function cancelDistribution(fileId) {
+            if (!confirm('Are you sure you want to cancel this distribution? Workers will stop downloading.')) {
                 return;
             }
 
             try {
-                const res = await fetch(`/admin/jobs/cancel/${jobId}`, { method: 'POST' });
+                const res = await fetch(`/admin/distributions/${fileId}/cancel`, { method: 'POST' });
                 if (res.ok) {
-                    fetchJobs();
-                    refreshJobDetails();
+                    fetchDistributions();
+                    refreshDistributionDetails();
                 } else {
-                    alert('Failed to cancel job: ' + await res.text());
+                    alert('Failed to cancel distribution: ' + await res.text());
                 }
             } catch (e) {
-                alert('Failed to cancel job: ' + e.message);
+                alert('Failed to cancel distribution: ' + e.message);
             }
         }
 
-        async function purgeJob(jobId) {
-            if (!confirm('Are you sure you want to purge this job? This will delete all shard data from servers.')) {
+        async function purgeDistribution(fileId) {
+            if (!confirm('Are you sure you want to purge this distribution? This will delete all data from workers.')) {
                 return;
             }
 
             try {
-                const res = await fetch(`/admin/jobs/purge/${jobId}`, { method: 'POST' });
+                const res = await fetch(`/admin/distributions/${fileId}/purge`, { method: 'POST' });
                 if (res.ok) {
-                    // Clear selection if we purged the current job
-                    if (currentJobId === jobId) {
-                        currentJobId = null;
-                        document.getElementById('jobDetailsCard').style.display = 'none';
+                    // Clear selection if we purged the current distribution
+                    if (currentFileId === fileId) {
+                        currentFileId = null;
+                        document.getElementById('distributionDetailsCard').style.display = 'none';
                     }
-                    fetchJobs();
+                    fetchDistributions();
                 } else {
-                    alert('Failed to purge job: ' + await res.text());
+                    alert('Failed to purge distribution: ' + await res.text());
                 }
             } catch (e) {
-                alert('Failed to purge job: ' + e.message);
+                alert('Failed to purge distribution: ' + e.message);
             }
         }
 
-        async function refreshJobDetails() {
-            if (!currentJobId) return;
+        async function refreshDistributionDetails() {
+            if (!currentFileId) return;
 
             try {
-                const res = await fetch(`/admin/jobs/${currentJobId}`);
+                const res = await fetch(`/admin/distributions/${currentFileId}`);
                 const details = await res.json();
 
-                document.getElementById('jobDetailsCard').style.display = 'block';
+                document.getElementById('distributionDetailsCard').style.display = 'block';
 
-                const totalChunks = details.job.totalChunks;
-                const totalSize = details.job.totalSize;
-                const chunkSize = details.job.chunkSize;
-                const tbody = document.querySelector('#jobProgressTable tbody');
+                const totalChunks = details.distribution.totalChunks;
+                const totalSize = details.distribution.totalSize;
+                const chunkSize = details.distribution.chunkSize;
+                const tbody = document.querySelector('#distributionProgressTable tbody');
 
                 // Calculate overall progress
-                const totalChunksCompleted = details.serverProgress.reduce((sum, p) => sum + p.lastChunkIdCompleted + 1, 0);
-                const totalExpectedChunks = details.serverProgress.length * totalChunks;
+                const totalChunksCompleted = details.workerProgress.reduce((sum, p) => sum + p.lastChunkIdCompleted + 1, 0);
+                const totalExpectedChunks = details.workerProgress.length * totalChunks;
                 const overallProgress = totalExpectedChunks > 0 ? (totalChunksCompleted / totalExpectedChunks * 100).toFixed(1) : 0;
 
                 // Calculate total bytes transferred
-                const totalBytesTransferred = details.serverProgress.reduce((sum, p) => {
+                const totalBytesTransferred = details.workerProgress.reduce((sum, p) => {
                     const chunksComplete = p.lastChunkIdCompleted + 1;
                     return sum + (chunksComplete * chunkSize);
                 }, 0);
-                const totalExpectedBytes = details.serverProgress.length * totalSize;
+                const totalExpectedBytes = details.workerProgress.length * totalSize;
 
-                document.getElementById('selectedJobId').textContent =
-                    `${currentJobId.substring(0, 8)}... (Overall: ${overallProgress}%)`;
+                document.getElementById('selectedFileId').textContent =
+                    `${currentFileId.substring(0, 8)}... (Overall: ${overallProgress}%)`;
 
-                // Calculate average progress across all servers
-                const serverCount = details.serverProgress.length;
-                const avgBytesComplete = serverCount > 0
-                    ? details.serverProgress.reduce((sum, p) => {
+                // Calculate average progress across all workers
+                const workerCount = details.workerProgress.length;
+                const avgBytesComplete = workerCount > 0
+                    ? details.workerProgress.reduce((sum, p) => {
                         const chunksComplete = p.lastChunkIdCompleted + 1;
                         return sum + Math.min(chunksComplete * chunkSize, totalSize);
-                    }, 0) / serverCount
+                    }, 0) / workerCount
                     : 0;
                 const avgProgress = totalSize > 0 ? (avgBytesComplete / totalSize * 100).toFixed(1) : 0;
 
-                document.getElementById('jobSummary').innerHTML = `
-                    <span><strong>Elapsed:</strong> ${formatElapsed(details.job.createdAt, details.job.updatedAt, details.job.status)}</span>
+                document.getElementById('distributionSummary').innerHTML = `
+                    <span><strong>Elapsed:</strong> ${formatElapsed(details.distribution.createdAt, details.distribution.updatedAt, details.distribution.status)}</span>
                     <span><strong>Total Size:</strong> ${formatBytes(totalSize)}</span>
                     <span><strong>Chunk Size:</strong> ${formatBytes(chunkSize)}</span>
                     <span><strong>Chunks:</strong> ${totalChunks}</span>
@@ -548,7 +548,7 @@
                 `;
 
                 // Sort by upstream (GCS first, then peers in order by address)
-                details.serverProgress.sort((a, b) => {
+                details.workerProgress.sort((a, b) => {
                     const ua = a.upstream || '';
                     const ub = b.upstream || '';
                     const aIsGcs = ua.startsWith('GCS');
@@ -559,7 +559,7 @@
                     return ua - ub;
                 });
 
-                tbody.innerHTML = details.serverProgress.map(p => {
+                tbody.innerHTML = details.workerProgress.map(p => {
                     const chunksComplete = p.lastChunkIdCompleted + 1;
                     const progress = totalChunks > 0 ? (chunksComplete / totalChunks * 100).toFixed(1) : 0;
                     const bytesComplete = Math.min(chunksComplete * chunkSize, totalSize);
@@ -570,8 +570,8 @@
 
                     return `
                         <tr>
-                            <td>${p.serverAddress}</td>
-                            <td><span class="status ${p.serverStatus}">${p.serverStatus}</span></td>
+                            <td>${p.workerAddress}</td>
+                            <td><span class="status ${p.workerStatus}">${p.workerStatus}</span></td>
                             <td>${p.upstream || '-'}</td>
                             <td><span class="status ${p.status}">${p.status}</span></td>
                             <td>
@@ -587,30 +587,30 @@
                     `;
                 }).join('');
             } catch (e) {
-                console.error('Failed to fetch job details:', e);
+                console.error('Failed to fetch distribution details:', e);
             }
         }
 
-        document.getElementById('createJobForm').addEventListener('submit', async (e) => {
+        document.getElementById('createDistributionForm').addEventListener('submit', async (e) => {
             e.preventDefault();
-            const resultDiv = document.getElementById('createJobResult');
+            const resultDiv = document.getElementById('createDistributionResult');
 
             try {
-                const res = await fetch('/admin/jobs', {
+                const res = await fetch('/admin/distributions', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        gcsFilePath: document.getElementById('gcsFilePath').value
+                        gcsPath: document.getElementById('gcsPath').value
                     })
                 });
 
                 if (res.ok) {
                     const data = await res.json();
-                    resultDiv.innerHTML = `<span class="success">Job created: ${data.deploymentJobId}</span>`;
-                    document.getElementById('createJobForm').reset();
-                    fetchJobs();
-                    // Auto-select the new job
-                    viewJobDetails(data.deploymentJobId);
+                    resultDiv.innerHTML = `<span class="success">Distribution created: ${data.fileId}</span>`;
+                    document.getElementById('createDistributionForm').reset();
+                    fetchDistributions();
+                    // Auto-select the new distribution
+                    viewDistributionDetails(data.fileId);
                 } else {
                     resultDiv.innerHTML = `<span class="error">Error: ${await res.text()}</span>`;
                 }
@@ -620,21 +620,21 @@
         });
 
         function refreshAll() {
-            fetchServers();
-            fetchJobs();
-            refreshJobDetails();
+            fetchWorkers();
+            fetchDistributions();
+            refreshDistributionDetails();
         }
 
         // Check URL for parameters on load
         function initFromUrl() {
             const params = new URLSearchParams(window.location.search);
-            const jobId = params.get('job');
+            const fileId = params.get('file');
             const tab = params.get('tab');
 
-            if (jobId) {
-                currentJobId = jobId;
+            if (fileId) {
+                currentFileId = fileId;
             }
-            if (tab && (tab === 'jobs' || tab === 'servers')) {
+            if (tab && (tab === 'distributions' || tab === 'workers')) {
                 switchTab(tab);
             }
         }

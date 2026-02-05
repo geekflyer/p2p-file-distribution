@@ -55,18 +55,13 @@ async fn main() -> anyhow::Result<()> {
         // Admin UI
         .route("/", get(admin_ui::admin_dashboard))
         // Admin API
-        .route("/admin/servers", get(api::list_servers))
-        .route("/admin/jobs", get(api::list_jobs).post(api::create_job))
-        .route("/admin/jobs/{id}", get(api::get_job_details))
-        .route("/admin/jobs/cancel/{id}", post(api::cancel_job))
-        .route("/admin/jobs/purge/{id}", post(api::purge_job))
-        // Server API
-        .route(
-            "/server/model-deployment-tasks",
-            get(api::get_deployment_tasks),
-        )
-        .route("/server/upstream/{serverAddress}", get(api::get_upstream))
-        .route("/server/heartbeat", post(api::heartbeat))
+        .route("/admin/workers", get(api::list_workers))
+        .route("/admin/distributions", get(api::list_distributions).post(api::create_distribution))
+        .route("/admin/distributions/{id}", get(api::get_distribution_details))
+        .route("/admin/distributions/{id}/cancel", post(api::cancel_distribution))
+        .route("/admin/distributions/{id}/purge", post(api::purge_distribution))
+        // Worker API
+        .route("/worker/check-in", post(api::check_in))
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(state);

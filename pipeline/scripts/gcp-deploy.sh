@@ -7,8 +7,8 @@ REGION="${GCP_REGION:-us-central1}"
 ZONE="${GCP_ZONE:-us-central1-a}"
 BUCKET_NAME="${GCP_BUCKET:-pipeline-test-$(whoami)}"
 COORDINATOR_VM="pipeline-coordinator"
-SERVER_PREFIX="pipeline-server"
-NUM_SERVERS="${NUM_SERVERS:-100}"
+WORKER_PREFIX="pipeline-worker"
+NUM_WORKERS="${NUM_WORKERS:-100}"
 TEST_DATA_SIZE_GB="${TEST_DATA_SIZE_GB:-100}"
 SHARD_SIZE_MB="${SHARD_SIZE_MB:-1024}"
 
@@ -39,7 +39,7 @@ check_prereqs() {
     log "Using project: $PROJECT_ID"
     log "Using region: $REGION, zone: $ZONE"
     log "Bucket: $BUCKET_NAME"
-    log "Servers: $NUM_SERVERS"
+    log "Workers: $NUM_WORKERS"
 
     gcloud auth list --filter=status:ACTIVE --format="value(account)" > /dev/null || \
         error "Not authenticated. Run: gcloud auth login"
@@ -69,7 +69,7 @@ build_binaries() {
             BINARY_DIR="target/x86_64-unknown-linux-gnu/release"
             log "Uploading binaries to GCS..."
             gsutil cp "$BINARY_DIR/coordinator" "gs://$BUCKET_NAME/binaries/"
-            gsutil cp "$BINARY_DIR/server" "gs://$BUCKET_NAME/binaries/"
+            gsutil cp "$BINARY_DIR/worker" "gs://$BUCKET_NAME/binaries/"
             gsutil cp -r coordinator/static "gs://$BUCKET_NAME/binaries/"
             return 0
         else
@@ -143,14 +143,14 @@ else
     gsutil cp "gs://$BUCKET/source/pipeline-source.tar.gz" ./
     tar xzf pipeline-source.tar.gz
 
-    # Build BOTH binaries so servers don't need to compile
-    cargo build --release -p coordinator -p server
+    # Build BOTH binaries so workers don't need to compile
+    cargo build --release -p coordinator -p worker
     cp target/release/coordinator ./coordinator
-    cp target/release/server ./server
+    cp target/release/worker ./worker
 
     # Upload binaries to GCS
     gsutil cp ./coordinator "gs://$BUCKET/binaries/coordinator"
-    gsutil cp ./server "gs://$BUCKET/binaries/server"
+    gsutil cp ./worker "gs://$BUCKET/binaries/worker"
     echo "Uploaded binaries to GCS"
 fi
 
@@ -328,9 +328,9 @@ STARTUP_EOF
     gsutil rm "gs://$BUCKET_NAME/builder-done"
 }
 
-# Create server VMs using instance template and managed instance group
-create_servers() {
-    log "Creating $NUM_SERVERS server VMs..."
+# Create worker VMs using instance template and managed instance group
+create_workers() {
+    log "Creating $NUM_WORKERS worker VMs..."
 
     # Get coordinator internal IP
     COORDINATOR_IP=$(gcloud compute instances describe "$COORDINATOR_VM" \
@@ -340,12 +340,12 @@ create_servers() {
     log "Coordinator IP: $COORDINATOR_IP"
 
     # Create instance template
-    local TEMPLATE_NAME="pipeline-server-template"
+    local TEMPLATE_NAME="pipeline-worker-template"
 
     # Delete existing template if it exists
     gcloud compute instance-templates delete "$TEMPLATE_NAME" --quiet 2>/dev/null || true
 
-    cat > /tmp/server-startup.sh << STARTUP_EOF
+    cat > /tmp/worker-startup.sh << STARTUP_EOF
 #!/bin/bash
 set -ex
 
@@ -353,15 +353,15 @@ set -ex
 BUCKET="$BUCKET_NAME"
 COORDINATOR_IP="$COORDINATOR_IP"
 
-# Get own IP for server address
+# Get own IP for worker address
 MY_IP=\$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip" -H "Metadata-Flavor: Google")
 
 mkdir -p /opt/pipeline
 cd /opt/pipeline
 
 # Try to download pre-built binary first
-if gsutil cp "gs://\$BUCKET/binaries/server" ./server 2>/dev/null; then
-    chmod +x ./server
+if gsutil cp "gs://\$BUCKET/binaries/worker" ./worker 2>/dev/null; then
+    chmod +x ./worker
     echo "Using pre-built binary"
 else
     echo "Building from source..."
@@ -376,20 +376,20 @@ else
 
     gsutil cp "gs://\$BUCKET/source/pipeline-source.tar.gz" ./
     tar xzf pipeline-source.tar.gz
-    cargo build --release -p server
-    cp target/release/server ./server
+    cargo build --release -p worker
+    cp target/release/worker ./worker
 
     # Upload binary to GCS so other VMs can use it
-    gsutil cp ./server "gs://\$BUCKET/binaries/server"
+    gsutil cp ./worker "gs://\$BUCKET/binaries/worker"
 fi
 
 # Create data directory
 mkdir -p /opt/pipeline/data
 
 # Create systemd service
-cat > /etc/systemd/system/server.service << EOF
+cat > /etc/systemd/system/worker.service << EOF
 [Unit]
-Description=Pipeline Server
+Description=Pipeline Worker
 After=network.target
 
 [Service]
@@ -398,10 +398,10 @@ User=root
 WorkingDirectory=/opt/pipeline
 Environment=DATA_DIR=/opt/pipeline/data
 Environment=COORDINATOR_URL=http://\$COORDINATOR_IP:8080
-Environment=SERVER_ADDR=\$MY_IP:50051
+Environment=WORKER_ADDR=\$MY_IP:50051
 Environment=GRPC_PORT=50051
 Environment=RUST_LOG=info
-ExecStart=/opt/pipeline/server
+ExecStart=/opt/pipeline/worker
 Restart=always
 RestartSec=5
 
@@ -410,27 +410,27 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable server
-systemctl start server
+systemctl enable worker
+systemctl start worker
 
-echo "Server started!"
+echo "Worker started!"
 STARTUP_EOF
 
     gcloud compute instance-templates create "$TEMPLATE_NAME" \
-        --machine-type="$SERVER_MACHINE_TYPE" \
+        --machine-type="$WORKER_MACHINE_TYPE" \
         --image-family=debian-12 \
         --image-project=debian-cloud \
-        --boot-disk-size="$SERVER_DISK_SIZE" \
+        --boot-disk-size="$WORKER_DISK_SIZE" \
         --boot-disk-type=pd-ssd \
         --scopes=storage-rw \
-        --tags=pipeline-server \
+        --tags=pipeline-worker \
         --no-address \
-        --metadata-from-file=startup-script=/tmp/server-startup.sh
+        --metadata-from-file=startup-script=/tmp/worker-startup.sh
 
-    rm /tmp/server-startup.sh
+    rm /tmp/worker-startup.sh
 
     # Create managed instance group
-    local MIG_NAME="pipeline-servers"
+    local MIG_NAME="pipeline-workers"
 
     # Delete existing MIG if it exists
     gcloud compute instance-groups managed delete "$MIG_NAME" --zone="$ZONE" --quiet 2>/dev/null || true
@@ -438,16 +438,16 @@ STARTUP_EOF
     gcloud compute instance-groups managed create "$MIG_NAME" \
         --zone="$ZONE" \
         --template="$TEMPLATE_NAME" \
-        --size="$NUM_SERVERS"
+        --size="$NUM_WORKERS"
 
-    log "Server instance group created with $NUM_SERVERS instances"
+    log "Worker instance group created with $NUM_WORKERS instances"
 }
 
 # Create firewall rules
 create_firewall_rules() {
     log "Creating firewall rules..."
 
-    # Allow internal traffic for gRPC between servers
+    # Allow internal traffic for gRPC between workers
     if ! gcloud compute firewall-rules describe pipeline-internal &>/dev/null; then
         gcloud compute firewall-rules create pipeline-internal \
             --direction=INGRESS \
@@ -455,8 +455,8 @@ create_firewall_rules() {
             --network=default \
             --action=ALLOW \
             --rules=tcp:50051,tcp:8080 \
-            --source-tags=pipeline-server,pipeline-coordinator \
-            --target-tags=pipeline-server,pipeline-coordinator
+            --source-tags=pipeline-worker,pipeline-coordinator \
+            --target-tags=pipeline-worker,pipeline-coordinator
     fi
 
     # Allow SSH via IAP (for VMs without external IPs)
@@ -468,7 +468,7 @@ create_firewall_rules() {
             --action=ALLOW \
             --rules=tcp:22 \
             --source-ranges=35.235.240.0/20 \
-            --target-tags=pipeline-server,pipeline-coordinator
+            --target-tags=pipeline-worker,pipeline-coordinator
     fi
 
     log "Firewall rules configured"
@@ -521,10 +521,10 @@ print_access_info() {
     echo "3. Check coordinator logs:"
     echo "   gcloud compute ssh $COORDINATOR_VM --zone=$ZONE -- journalctl -u coordinator -f"
     echo ""
-    echo "4. Check server count in UI or:"
-    echo "   curl -s http://localhost:8080/admin/servers | jq length"
+    echo "4. Check worker count in UI or:"
+    echo "   curl -s http://localhost:8080/admin/workers | jq length"
     echo ""
-    echo "5. Create a deployment job in the UI with:"
+    echo "5. Create a file distribution in the UI with:"
     echo "   GCS File Path: gs://$BUCKET_NAME/testdata"
     echo "   Manifest Path: gs://$BUCKET_NAME/testdata/model.manifest"
     echo ""
@@ -542,10 +542,10 @@ cleanup() {
     fi
 
     # Delete instance group
-    gcloud compute instance-groups managed delete pipeline-servers --zone="$ZONE" --quiet 2>/dev/null || true
+    gcloud compute instance-groups managed delete pipeline-workers --zone="$ZONE" --quiet 2>/dev/null || true
 
     # Delete instance template
-    gcloud compute instance-templates delete pipeline-server-template --quiet 2>/dev/null || true
+    gcloud compute instance-templates delete pipeline-worker-template --quiet 2>/dev/null || true
 
     # Delete coordinator
     gcloud compute instances delete "$COORDINATOR_VM" --zone="$ZONE" --quiet 2>/dev/null || true
@@ -586,7 +586,7 @@ main() {
             setup_private_networking
             create_coordinator
             generate_test_data
-            create_servers
+            create_workers
             print_access_info
             ;;
         cleanup)
@@ -598,8 +598,8 @@ main() {
             echo "Coordinator:"
             gcloud compute instances describe "$COORDINATOR_VM" --zone="$ZONE" --format="table(name,status,networkInterfaces[0].networkIP)" 2>/dev/null || echo "  Not found"
             echo ""
-            echo "Servers:"
-            gcloud compute instance-groups managed list-instances pipeline-servers --zone="$ZONE" 2>/dev/null || echo "  Not found"
+            echo "Workers:"
+            gcloud compute instance-groups managed list-instances pipeline-workers --zone="$ZONE" 2>/dev/null || echo "  Not found"
             ;;
         tunnel)
             log "Opening SSH tunnel to coordinator..."

@@ -1,4 +1,5 @@
-use common::proto::file_transfer_client::FileTransferClient;
+use bytes::Bytes;
+use common::proto::p2p_transfer_client::P2pTransferClient;
 use common::proto::ChunkRequest;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
@@ -6,24 +7,27 @@ use object_store::ObjectStore;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore};
 use tonic::transport::Channel;
 use uuid::Uuid;
 
+use crate::chunk_cache::SharedChunkCache;
 use crate::constants::GRPC_MAX_MESSAGE_SIZE;
 use crate::storage::{compute_crc32c, ChunkStorage};
 
-/// Number of chunks to batch per GCS request (~160MB with 16MB chunks)
-const GCS_BATCH_CHUNKS: usize = 10;
+/// Number of chunks to batch per GCS request (~256MB with 64MB chunks)
+const GCS_BATCH_CHUNKS: usize = 4;
 
-/// Number of parallel GCS downloads (each ~160MB)
-const GCS_PARALLEL_DOWNLOADS: usize = 8;
+/// Number of parallel GCS downloads (reduced to limit memory usage)
+const GCS_PARALLEL_DOWNLOADS: usize = 4;
 
 /// Type alias for the gRPC client used for peer transfers
-pub type PeerClient = FileTransferClient<Channel>;
+pub type PeerClient = P2pTransferClient<Channel>;
 
 pub struct Downloader {
     storage: Arc<ChunkStorage>,
+    /// In-memory chunk cache for faster P2P streaming
+    chunk_cache: SharedChunkCache,
     /// Cache of bucket -> ObjectStore
     bucket_stores: RwLock<HashMap<String, Arc<dyn ObjectStore>>>,
     /// Optional rate limit for GCS downloads in bytes per second
@@ -33,7 +37,7 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    pub fn new(storage: Arc<ChunkStorage>) -> anyhow::Result<Self> {
+    pub fn new(storage: Arc<ChunkStorage>, chunk_cache: SharedChunkCache) -> anyhow::Result<Self> {
         // Parse bandwidth limits (e.g., "10m" for 10 Mbit/s, "1g" for 1 Gbit/s)
         let gcs_bandwidth_limit_bps = std::env::var("TEST_ONLY_LIMIT_GCS_BANDWIDTH")
             .ok()
@@ -53,6 +57,7 @@ impl Downloader {
 
         Ok(Self {
             storage,
+            chunk_cache,
             bucket_stores: RwLock::new(HashMap::new()),
             gcs_bandwidth_limit_bps,
             p2p_bandwidth_limit_bps,
@@ -96,7 +101,7 @@ impl Downloader {
     pub async fn connect_to_peer(peer_addr: &str) -> anyhow::Result<PeerClient> {
         let addr = format!("http://{}", peer_addr);
         tracing::info!("Connecting to peer at {}", addr);
-        let client = FileTransferClient::connect(addr)
+        let client = P2pTransferClient::connect(addr)
             .await?
             .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
             .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
@@ -107,8 +112,8 @@ impl Downloader {
     /// Uses a channel-based approach: N parallel downloaders -> ordered writer
     pub async fn download_chunks_from_gcs<F, Fut>(
         &self,
-        job_id: Uuid,
-        gcs_file_path: &str,
+        file_id: Uuid,
+        gcs_path: &str,
         start_chunk: i32,
         total_chunks: i32,
         chunk_size: u64,
@@ -119,7 +124,7 @@ impl Downloader {
         F: Fn(i32, i32, u64, Option<u64>) -> Fut + Send + Sync,
         Fut: Future<Output = ()> + Send,
     {
-        let (bucket, object) = parse_gcs_path(gcs_file_path)?;
+        let (bucket, object) = parse_gcs_path(gcs_path)?;
 
         tracing::info!(
             "Downloading chunks {}-{} from GCS: gs://{}/{} ({} parallel)",
@@ -215,7 +220,7 @@ impl Downloader {
                     .unwrap();
 
                 total_bytes_downloaded += self.write_batch(
-                    job_id, batch_start, batch_end, total_chunks, chunk_size, &data,
+                    file_id, batch_start, batch_end, total_chunks, chunk_size, &data,
                     total_bytes_downloaded, &download_start, &on_progress
                 ).await?;
 
@@ -229,7 +234,7 @@ impl Downloader {
                         .unwrap();
 
                     total_bytes_downloaded += self.write_batch(
-                        job_id, next_batch_start, batch_end, total_chunks, chunk_size, &buffered_data,
+                        file_id, next_batch_start, batch_end, total_chunks, chunk_size, &buffered_data,
                         total_bytes_downloaded, &download_start, &on_progress
                     ).await?;
 
@@ -268,7 +273,7 @@ impl Downloader {
     /// Helper to write a batch to storage and report progress
     async fn write_batch<F, Fut>(
         &self,
-        job_id: Uuid,
+        file_id: Uuid,
         batch_start: i32,
         batch_end: i32,
         total_chunks: i32,
@@ -293,7 +298,12 @@ impl Downloader {
             };
 
             let chunk_data = &data[offset_in_batch..chunk_end_offset];
-            self.storage.append_chunk(job_id, chunk_data).await?;
+
+            // Compute CRC32C and cache the chunk for P2P serving
+            let crc32c = compute_crc32c(chunk_data);
+            self.chunk_cache.put(file_id, chunk_id, Bytes::copy_from_slice(chunk_data), crc32c).await;
+
+            self.storage.append_chunk(file_id, chunk_data).await?;
 
             bytes_written += chunk_data.len() as u64;
             let total = bytes_so_far + bytes_written;
@@ -315,7 +325,7 @@ impl Downloader {
     pub async fn download_chunks_from_peer<F, Fut>(
         &self,
         client: &mut PeerClient,
-        job_id: Uuid,
+        file_id: Uuid,
         start_from_chunk: i32,
         total_chunks: i32,
         chunk_size: u64,
@@ -327,7 +337,7 @@ impl Downloader {
         Fut: Future<Output = ()> + Send,
     {
         let request = ChunkRequest {
-            job_id: job_id.to_string(),
+            file_id: file_id.to_string(),
             start_from_chunk_id: start_from_chunk,
         };
 
@@ -380,8 +390,16 @@ impl Downloader {
                 return Ok(false);
             }
 
+            // Cache the chunk for P2P serving to downstream workers
+            self.chunk_cache.put(
+                file_id,
+                chunk_data.chunk_id,
+                Bytes::copy_from_slice(&chunk_data.data),
+                actual_crc32c,
+            ).await;
+
             // Append chunk to storage
-            self.storage.append_chunk(job_id, &chunk_data.data).await?;
+            self.storage.append_chunk(file_id, &chunk_data.data).await?;
 
             total_bytes_downloaded += chunk_data.data.len() as u64;
             last_chunk_received = chunk_data.chunk_id;

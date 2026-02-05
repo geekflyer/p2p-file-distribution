@@ -1,18 +1,19 @@
 syntax = "proto3";
-package file_transfer;
+package pipeline;
 
-service FileTransfer {
+// P2P transfer between workers
+service P2PTransfer {
   // Stream chunks to downstream peers
   rpc StreamChunks(ChunkRequest) returns (stream ChunkData);
 }
 
 message ChunkRequest {
-  string job_id = 1;
+  string file_id = 1;
   int32 start_from_chunk_id = 2;  // Start streaming from this chunk
 }
 
 message ChunkData {
   int32 chunk_id = 1;             // Which chunk
-  bytes data = 2;                 // Entire chunk data (up to 16MB)
+  bytes data = 2;                 // Entire chunk data (up to 64MB)
   fixed32 crc32c = 3;             // Chunk integrity
 }
