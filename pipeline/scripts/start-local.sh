@@ -43,7 +43,7 @@ for i in $(seq 1 $NUM_WORKERS); do
     padded=$(printf "%02d" $i)
 
     WORKER_ADDR="localhost:${port}" \
-    GRPC_PORT="${port}" \
+    TCP_PORT="${port}" \
     DATA_DIR="./data/workers/worker${padded}" \
     ./target/release/worker > /tmp/worker${i}.log 2>&1 &
 done

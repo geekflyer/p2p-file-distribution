@@ -122,25 +122,44 @@ async fn stream_chunks_sendfile(
     let total_size = meta.total_size;
     let total_chunks = meta.total_chunks;
 
-    // Open the data file once for all chunks
+    // Wait for first chunk before opening file (file might not exist yet)
+    let mut waited_ms: u64 = 0;
+    while !storage
+        .is_chunk_complete(file_id, start_chunk, chunk_size, total_size)
+        .await
+    {
+        if waited_ms >= MAX_WAIT_MS {
+            tracing::warn!(
+                "First chunk {} for file {} not available after {}ms, ending stream",
+                start_chunk, file_id, waited_ms
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+        waited_ms += POLL_INTERVAL_MS;
+    }
+
+    // Open the data file once for all chunks (file now exists)
     let (data_file, _data_fd) = storage.open_file_for_sendfile(file_id)?;
 
     for chunk_id in start_chunk..total_chunks {
-        // Wait for chunk to be available
-        let mut waited_ms: u64 = 0;
-        while !storage
-            .is_chunk_complete(file_id, chunk_id, chunk_size, total_size)
-            .await
-        {
-            if waited_ms >= MAX_WAIT_MS {
-                tracing::warn!(
-                    "Chunk {} for file {} not available after {}ms, ending stream",
-                    chunk_id, file_id, waited_ms
-                );
-                return Ok(());
+        // Wait for chunk to be available (skip first chunk, already waited)
+        if chunk_id > start_chunk {
+            let mut waited_ms: u64 = 0;
+            while !storage
+                .is_chunk_complete(file_id, chunk_id, chunk_size, total_size)
+                .await
+            {
+                if waited_ms >= MAX_WAIT_MS {
+                    tracing::warn!(
+                        "Chunk {} for file {} not available after {}ms, ending stream",
+                        chunk_id, file_id, waited_ms
+                    );
+                    return Ok(());
+                }
+                tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+                waited_ms += POLL_INTERVAL_MS;
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
-            waited_ms += POLL_INTERVAL_MS;
         }
 
         // Get chunk info (offset, size, crc32c)
