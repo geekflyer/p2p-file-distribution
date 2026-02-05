@@ -43,10 +43,11 @@ async fn init_db(pool: &DbPool) -> Result<(), sqlx::Error> {
         CREATE TABLE IF NOT EXISTS model_deployment_jobs (
             deployment_job_id TEXT PRIMARY KEY,
             created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            gcs_manifest_path TEXT NOT NULL,
-            total_shards INTEGER NOT NULL DEFAULT 0,
+            gcs_file_path TEXT NOT NULL,
+            total_chunks INTEGER NOT NULL DEFAULT 0,
             total_size INTEGER NOT NULL DEFAULT 0,
-            shard_size INTEGER NOT NULL DEFAULT 0,
+            chunk_size INTEGER NOT NULL DEFAULT 0,
+            file_crc32c TEXT NOT NULL DEFAULT '',
             status TEXT NOT NULL DEFAULT 'created',
             updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )
@@ -60,9 +61,7 @@ async fn init_db(pool: &DbPool) -> Result<(), sqlx::Error> {
         CREATE TABLE IF NOT EXISTS server_model_deployment_tasks (
             server_address TEXT NOT NULL,
             deployment_job_id TEXT NOT NULL REFERENCES model_deployment_jobs(deployment_job_id),
-            last_shard_id_completed INTEGER NOT NULL DEFAULT -1,
-            current_shard_id INTEGER,
-            current_shard_progress_pct REAL,
+            last_chunk_id_completed INTEGER NOT NULL DEFAULT -1,
             prev_bytes_downloaded INTEGER,
             prev_bytes_downloaded_at TEXT,
             now_bytes_downloaded INTEGER,
@@ -102,22 +101,46 @@ async fn init_db(pool: &DbPool) -> Result<(), sqlx::Error> {
         .await
         .ok(); // Ignore error if column already exists
 
+    // Migration: Add file_crc32c column for existing databases
+    sqlx::query("ALTER TABLE model_deployment_jobs ADD COLUMN file_crc32c TEXT DEFAULT ''")
+        .execute(pool)
+        .await
+        .ok(); // Ignore error if column already exists
+
+    // Migration: Add disk stats columns to servers
+    sqlx::query("ALTER TABLE servers ADD COLUMN disk_total_bytes INTEGER")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE servers ADD COLUMN disk_used_bytes INTEGER")
+        .execute(pool)
+        .await
+        .ok();
+
     Ok(())
 }
 
 // ============ Server Operations ============
 
-/// Upsert server with heartbeat
-pub async fn upsert_server(pool: &DbPool, server_address: &str) -> Result<(), sqlx::Error> {
+/// Upsert server with heartbeat and disk stats
+pub async fn upsert_server(
+    pool: &DbPool,
+    server_address: &str,
+    disk_total_bytes: Option<u64>,
+    disk_used_bytes: Option<u64>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         r#"
-        INSERT INTO servers (server_address, last_heartbeat, status, updated_at)
-        VALUES ($1, datetime('now'), 'healthy', datetime('now'))
+        INSERT INTO servers (server_address, last_heartbeat, status, updated_at, disk_total_bytes, disk_used_bytes)
+        VALUES ($1, datetime('now'), 'healthy', datetime('now'), $2, $3)
         ON CONFLICT (server_address) DO UPDATE
-        SET last_heartbeat = datetime('now'), status = 'healthy', updated_at = datetime('now')
+        SET last_heartbeat = datetime('now'), status = 'healthy', updated_at = datetime('now'),
+            disk_total_bytes = $2, disk_used_bytes = $3
         "#,
     )
     .bind(server_address)
+    .bind(disk_total_bytes.map(|v| v as i64))
+    .bind(disk_used_bytes.map(|v| v as i64))
     .execute(pool)
     .await?;
     Ok(())
@@ -125,15 +148,15 @@ pub async fn upsert_server(pool: &DbPool, server_address: &str) -> Result<(), sq
 
 /// Get all servers
 pub async fn get_all_servers(pool: &DbPool) -> Result<Vec<Server>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT server_address, last_heartbeat, status FROM servers ORDER BY server_address",
+    let rows = sqlx::query_as::<_, (String, String, String, Option<i64>, Option<i64>)>(
+        "SELECT server_address, last_heartbeat, status, disk_total_bytes, disk_used_bytes FROM servers ORDER BY server_address",
     )
     .fetch_all(pool)
     .await?;
 
     Ok(rows
         .into_iter()
-        .filter_map(|(server_address, last_heartbeat, status)| {
+        .filter_map(|(server_address, last_heartbeat, status, disk_total, disk_used)| {
             let last_heartbeat = DateTime::parse_from_rfc3339(&last_heartbeat)
                 .or_else(|_| {
                     // Try parsing SQLite datetime format
@@ -146,20 +169,22 @@ pub async fn get_all_servers(pool: &DbPool) -> Result<Vec<Server>, sqlx::Error> 
                 server_address,
                 last_heartbeat,
                 status: status.parse().unwrap_or(ServerStatus::Unhealthy),
+                disk_total_bytes: disk_total.map(|v| v as u64),
+                disk_used_bytes: disk_used.map(|v| v as u64),
             })
         })
         .collect())
 }
 
 /// Get healthy servers ordered by progress on a specific job (for topology building)
-/// Returns servers sorted by (last_shard_id_completed DESC, server_address ASC)
+/// Returns servers sorted by (last_chunk_id_completed DESC, server_address ASC)
 pub async fn get_servers_by_job_progress(
     pool: &DbPool,
     job_id: Uuid,
 ) -> Result<Vec<(String, i32)>, sqlx::Error> {
     let rows = sqlx::query_as::<_, (String, i32)>(
         r#"
-        SELECT s.server_address, COALESCE(t.last_shard_id_completed, -1) as progress
+        SELECT s.server_address, COALESCE(t.last_chunk_id_completed, -1) as progress
         FROM servers s
         LEFT JOIN server_model_deployment_tasks t
             ON s.server_address = t.server_address
@@ -196,24 +221,26 @@ pub async fn mark_stale_servers_unhealthy(pool: &DbPool) -> Result<u64, sqlx::Er
 /// Create a new deployment job
 pub async fn create_job(
     pool: &DbPool,
-    gcs_manifest_path: &str,
-    total_shards: i32,
+    gcs_file_path: &str,
     total_size: u64,
-    shard_size: u64,
+    chunk_size: u64,
+    file_crc32c: &str,
 ) -> Result<Uuid, sqlx::Error> {
     let job_id = Uuid::new_v4();
+    let total_chunks = ((total_size + chunk_size - 1) / chunk_size) as i32;
 
     sqlx::query(
         r#"
-        INSERT INTO model_deployment_jobs (deployment_job_id, gcs_manifest_path, total_shards, total_size, shard_size, status, created_at, updated_at)
-        VALUES ($1, $2, $3, $4, $5, 'created', datetime('now'), datetime('now'))
+        INSERT INTO model_deployment_jobs (deployment_job_id, gcs_file_path, total_chunks, total_size, chunk_size, file_crc32c, status, created_at, updated_at)
+        VALUES ($1, $2, $3, $4, $5, $6, 'created', datetime('now'), datetime('now'))
         "#,
     )
     .bind(job_id.to_string())
-    .bind(gcs_manifest_path)
-    .bind(total_shards)
+    .bind(gcs_file_path)
+    .bind(total_chunks)
     .bind(total_size as i64)
-    .bind(shard_size as i64)
+    .bind(chunk_size as i64)
+    .bind(file_crc32c)
     .execute(pool)
     .await?;
 
@@ -234,9 +261,9 @@ pub async fn create_job(
 
 /// Get all deployment jobs
 pub async fn get_all_jobs(pool: &DbPool) -> Result<Vec<DeploymentJob>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, String, String, String, i32, i64, i64, String)>(
+    let rows = sqlx::query_as::<_, (String, String, String, String, i32, i64, i64, String, String)>(
         r#"
-        SELECT deployment_job_id, created_at, updated_at, gcs_manifest_path, total_shards, total_size, shard_size, status
+        SELECT deployment_job_id, created_at, updated_at, gcs_file_path, total_chunks, total_size, chunk_size, COALESCE(file_crc32c, '') as file_crc32c, status
         FROM model_deployment_jobs
         ORDER BY created_at DESC
         "#,
@@ -247,7 +274,7 @@ pub async fn get_all_jobs(pool: &DbPool) -> Result<Vec<DeploymentJob>, sqlx::Err
     Ok(rows
         .into_iter()
         .filter_map(
-            |(deployment_job_id, created_at, updated_at, gcs_manifest_path, total_shards, total_size, shard_size, status)| {
+            |(deployment_job_id, created_at, updated_at, gcs_file_path, total_chunks, total_size, chunk_size, file_crc32c, status)| {
                 let deployment_job_id = Uuid::parse_str(&deployment_job_id).ok()?;
                 let created_at = parse_datetime(&created_at)?;
                 let updated_at = parse_datetime(&updated_at)?;
@@ -255,10 +282,11 @@ pub async fn get_all_jobs(pool: &DbPool) -> Result<Vec<DeploymentJob>, sqlx::Err
                     deployment_job_id,
                     created_at,
                     updated_at,
-                    gcs_manifest_path,
-                    total_shards,
+                    gcs_file_path,
+                    total_chunks,
                     total_size: total_size as u64,
-                    shard_size: shard_size as u64,
+                    chunk_size: chunk_size as u64,
+                    file_crc32c,
                     status: status.parse().unwrap_or(JobStatus::Failed),
                 })
             },
@@ -268,9 +296,9 @@ pub async fn get_all_jobs(pool: &DbPool) -> Result<Vec<DeploymentJob>, sqlx::Err
 
 /// Get a specific job by ID
 pub async fn get_job(pool: &DbPool, job_id: Uuid) -> Result<Option<DeploymentJob>, sqlx::Error> {
-    let row = sqlx::query_as::<_, (String, String, String, String, i32, i64, i64, String)>(
+    let row = sqlx::query_as::<_, (String, String, String, String, i32, i64, i64, String, String)>(
         r#"
-        SELECT deployment_job_id, created_at, updated_at, gcs_manifest_path, total_shards, total_size, shard_size, status
+        SELECT deployment_job_id, created_at, updated_at, gcs_file_path, total_chunks, total_size, chunk_size, COALESCE(file_crc32c, '') as file_crc32c, status
         FROM model_deployment_jobs
         WHERE deployment_job_id = $1
         "#,
@@ -280,7 +308,7 @@ pub async fn get_job(pool: &DbPool, job_id: Uuid) -> Result<Option<DeploymentJob
     .await?;
 
     Ok(row.and_then(
-        |(deployment_job_id, created_at, updated_at, gcs_manifest_path, total_shards, total_size, shard_size, status)| {
+        |(deployment_job_id, created_at, updated_at, gcs_file_path, total_chunks, total_size, chunk_size, file_crc32c, status)| {
             let deployment_job_id = Uuid::parse_str(&deployment_job_id).ok()?;
             let created_at = parse_datetime(&created_at)?;
             let updated_at = parse_datetime(&updated_at)?;
@@ -288,10 +316,11 @@ pub async fn get_job(pool: &DbPool, job_id: Uuid) -> Result<Option<DeploymentJob
                 deployment_job_id,
                 created_at,
                 updated_at,
-                gcs_manifest_path,
-                total_shards,
+                gcs_file_path,
+                total_chunks,
                 total_size: total_size as u64,
-                shard_size: shard_size as u64,
+                chunk_size: chunk_size as u64,
+                file_crc32c,
                 status: status.parse().unwrap_or(JobStatus::Failed),
             })
         },
@@ -304,9 +333,9 @@ pub async fn get_job_server_progress(
     job_id: Uuid,
 ) -> Result<Vec<ServerTaskProgress>, sqlx::Error> {
     // Query returns server-reported throughput directly (no calculation needed)
-    let rows = sqlx::query_as::<_, (String, i32, Option<i32>, Option<f64>, Option<i64>, Option<i64>, String, String)>(
+    let rows = sqlx::query_as::<_, (String, i32, Option<i64>, Option<i64>, String, String)>(
         r#"
-        SELECT t.server_address, t.last_shard_id_completed, t.current_shard_id, t.current_shard_progress_pct,
+        SELECT t.server_address, t.last_chunk_id_completed,
                t.download_throughput_bps, t.upload_throughput_bps,
                t.status, COALESCE(s.status, 'unhealthy') as server_status
         FROM server_model_deployment_tasks t
@@ -321,18 +350,16 @@ pub async fn get_job_server_progress(
 
     Ok(rows
         .into_iter()
-        .map(|(server_address, last_shard_id_completed, current_shard_id, current_shard_progress_pct,
+        .map(|(server_address, last_chunk_id_completed,
                download_throughput_bps, upload_throughput_bps, status, server_status)| {
             ServerTaskProgress {
                 server_address,
-                last_shard_id_completed,
+                last_chunk_id_completed,
                 status: status.parse().unwrap_or(TaskStatus::Failed),
                 server_status: server_status.parse().unwrap_or(ServerStatus::Unhealthy),
                 upstream: None,
                 download_throughput_bps: download_throughput_bps.map(|v| v as u64),
                 upload_throughput_bps: upload_throughput_bps.map(|v| v as u64),
-                current_shard_id,
-                current_shard_progress_pct: current_shard_progress_pct.map(|p| p as f32),
             }
         })
         .collect())
@@ -345,9 +372,9 @@ pub async fn get_server_tasks(
     pool: &DbPool,
     server_address: &str,
 ) -> Result<Vec<DeploymentTask>, sqlx::Error> {
-    let rows = sqlx::query_as::<_, (String, String, i32, i64)>(
+    let rows = sqlx::query_as::<_, (String, String, i32, i64, i64, String)>(
         r#"
-        SELECT j.deployment_job_id, j.gcs_manifest_path, j.total_shards, j.shard_size
+        SELECT j.deployment_job_id, j.gcs_file_path, j.total_chunks, j.total_size, j.chunk_size, COALESCE(j.file_crc32c, '') as file_crc32c
         FROM server_model_deployment_tasks t
         JOIN model_deployment_jobs j ON t.deployment_job_id = j.deployment_job_id
         WHERE t.server_address = $1 AND t.status NOT IN ('completed', 'cancelled')
@@ -360,28 +387,27 @@ pub async fn get_server_tasks(
 
     Ok(rows
         .into_iter()
-        .filter_map(|(deployment_job_id, gcs_manifest_path, total_shards, shard_size)| {
+        .filter_map(|(deployment_job_id, gcs_file_path, total_chunks, total_size, chunk_size, file_crc32c)| {
             let deployment_job_id = Uuid::parse_str(&deployment_job_id).ok()?;
             Some(DeploymentTask {
                 deployment_job_id,
-                gcs_manifest_path,
-                total_shards,
-                shard_size: shard_size as u64,
+                gcs_file_path,
+                total_chunks,
+                total_size: total_size as u64,
+                chunk_size: chunk_size as u64,
+                file_crc32c,
             })
         })
         .collect())
 }
 
-/// Update task progress - only writes last_shard_id_completed when shard completes
-/// Always updates current progress for UI display
+/// Update task progress - only writes last_chunk_id_completed when chunk completes
 /// Stores server-reported throughput directly (no longer calculated from deltas)
 pub async fn update_task_progress(
     pool: &DbPool,
     server_address: &str,
     job_id: Uuid,
-    last_shard_id_completed: i32,
-    current_shard_id: Option<i32>,
-    current_shard_progress_pct: Option<f32>,
+    last_chunk_id_completed: i32,
     completed: bool,
     bytes_downloaded: u64,
     bytes_uploaded: u64,
@@ -395,22 +421,18 @@ pub async fn update_task_progress(
     sqlx::query(
         r#"
         UPDATE server_model_deployment_tasks
-        SET last_shard_id_completed = $1,
-            current_shard_id = $2,
-            current_shard_progress_pct = $3,
-            status = $4,
-            now_bytes_downloaded = $5,
-            now_bytes_uploaded = $6,
-            download_throughput_bps = $7,
-            upload_throughput_bps = $8,
+        SET last_chunk_id_completed = $1,
+            status = $2,
+            now_bytes_downloaded = $3,
+            now_bytes_uploaded = $4,
+            download_throughput_bps = $5,
+            upload_throughput_bps = $6,
             updated_at = datetime('now')
-        WHERE server_address = $9 AND deployment_job_id = $10
+        WHERE server_address = $7 AND deployment_job_id = $8
           AND status NOT IN ('cancelled')
         "#,
     )
-    .bind(last_shard_id_completed)
-    .bind(current_shard_id)
-    .bind(current_shard_progress_pct.map(|p| p as f64))
+    .bind(last_chunk_id_completed)
     .bind(status)
     .bind(bytes_downloaded as i64)
     .bind(bytes_uploaded as i64)

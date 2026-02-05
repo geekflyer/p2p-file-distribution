@@ -1,31 +1,29 @@
 use common::proto::file_transfer_client::FileTransferClient;
-use common::proto::ShardRequest;
-use common::GcsManifest;
-use futures::StreamExt;
+use common::proto::ChunkRequest;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::ops::Range;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tonic::transport::Channel;
 use uuid::Uuid;
 
 use crate::constants::GRPC_MAX_MESSAGE_SIZE;
-use crate::storage::{compute_crc32c, ShardStorage};
+use crate::storage::{compute_crc32c, ChunkStorage};
 
-/// Number of parallel range requests for GCS downloads (can be overridden via env var)
-const DEFAULT_GCS_PARALLEL_RANGES: usize = 8;
+/// Number of chunks to batch per GCS request (~160MB with 16MB chunks)
+const GCS_BATCH_CHUNKS: usize = 10;
+
+/// Number of parallel GCS downloads (each ~160MB)
+const GCS_PARALLEL_DOWNLOADS: usize = 8;
 
 /// Type alias for the gRPC client used for peer transfers
 pub type PeerClient = FileTransferClient<Channel>;
 
 pub struct Downloader {
-    storage: Arc<ShardStorage>,
+    storage: Arc<ChunkStorage>,
     /// Cache of bucket -> ObjectStore
     bucket_stores: RwLock<HashMap<String, Arc<dyn ObjectStore>>>,
     /// Optional rate limit for GCS downloads in bytes per second
@@ -35,7 +33,7 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    pub fn new(storage: Arc<ShardStorage>) -> anyhow::Result<Self> {
+    pub fn new(storage: Arc<ChunkStorage>) -> anyhow::Result<Self> {
         // Parse bandwidth limits (e.g., "10m" for 10 Mbit/s, "1g" for 1 Gbit/s)
         let gcs_bandwidth_limit_bps = std::env::var("TEST_ONLY_LIMIT_GCS_BANDWIDTH")
             .ok()
@@ -94,30 +92,6 @@ impl Downloader {
         Ok(store)
     }
 
-    /// Fetch manifest from GCS
-    pub async fn fetch_manifest(&self, gcs_manifest_path: &str) -> anyhow::Result<GcsManifest> {
-        // Check for emulator
-        if let Ok(emulator_url) = std::env::var("STORAGE_EMULATOR_HOST") {
-            let (bucket, object) = parse_gcs_path(gcs_manifest_path)?;
-            let url = format!(
-                "{}/storage/v1/b/{}/o/{}?alt=media",
-                emulator_url,
-                bucket,
-                urlencoding::encode(object)
-            );
-            let data = reqwest::get(&url).await?.bytes().await?;
-            let manifest: GcsManifest = serde_json::from_slice(&data)?;
-            return Ok(manifest);
-        }
-
-        let (bucket, object) = parse_gcs_path(gcs_manifest_path)?;
-        let store = self.get_store(bucket).await?;
-        let path = ObjectPath::from(object);
-        let data = store.get(&path).await?.bytes().await?.to_vec();
-        let manifest: GcsManifest = serde_json::from_slice(&data)?;
-        Ok(manifest)
-    }
-
     /// Connect to a peer for P2P transfers
     pub async fn connect_to_peer(peer_addr: &str) -> anyhow::Result<PeerClient> {
         let addr = format!("http://{}", peer_addr);
@@ -129,317 +103,245 @@ impl Downloader {
         Ok(client)
     }
 
-    /// Download a shard from GCS and verify SHA256
-    /// shard_path is relative to gcs_base_path (e.g., "shard_0000.bin")
-    pub async fn download_shard_from_gcs<F, Fut>(
+    /// Download chunks from GCS in batches with parallel downloads for efficiency
+    /// Uses a channel-based approach: N parallel downloaders -> ordered writer
+    pub async fn download_chunks_from_gcs<F, Fut>(
         &self,
         job_id: Uuid,
-        gcs_base_path: &str,
-        shard_path: &str,
-        shard_id: i32,
-        shard_size: u64,
+        gcs_file_path: &str,
+        start_chunk: i32,
+        total_chunks: i32,
+        chunk_size: u64,
+        total_size: u64,
         on_progress: F,
     ) -> anyhow::Result<bool>
     where
-        F: Fn(u64, u64, Option<u64>) -> Fut + Send + Sync,
+        F: Fn(i32, i32, u64, Option<u64>) -> Fut + Send + Sync,
         Fut: Future<Output = ()> + Send,
     {
-        let (bucket, object_path) = parse_gcs_path(gcs_base_path)?;
-        let shard_object = format!("{}/{}", object_path, shard_path);
+        let (bucket, object) = parse_gcs_path(gcs_file_path)?;
 
-        tracing::info!("Downloading shard {} from GCS: gs://{}/{}", shard_id, bucket, shard_object);
+        tracing::info!(
+            "Downloading chunks {}-{} from GCS: gs://{}/{} ({} parallel)",
+            start_chunk, total_chunks - 1, bucket, object, GCS_PARALLEL_DOWNLOADS
+        );
 
-        // Start partial file with buffered writer for efficient streaming
-        let mut writer = self.storage.start_partial_shard_writer(job_id, shard_id).await?;
-
-        let mut sha256_hasher = Sha256::new();
-        let mut bytes_downloaded: u64 = 0;
-        let mut throughput_tracker = ThroughputTracker::new();
         let download_start = std::time::Instant::now();
 
-        // For emulator, use direct HTTP streaming; for production, use object_store
-        let download_result: Result<(), anyhow::Error> = async {
-            if let Ok(emulator_url) = std::env::var("STORAGE_EMULATOR_HOST") {
-                let url = format!(
-                    "{}/storage/v1/b/{}/o/{}?alt=media",
-                    emulator_url,
-                    bucket,
-                    urlencoding::encode(&shard_object)
-                );
-                let response = match reqwest::get(&url).await {
-                    Ok(r) if r.status().is_success() => r,
-                    Ok(r) => {
-                        anyhow::bail!("GCS emulator HTTP {}", r.status());
-                    }
-                    Err(e) => {
-                        anyhow::bail!("GCS emulator error: {}", e);
-                    }
+        // Calculate all batches upfront
+        let mut batches: Vec<(i32, i32)> = Vec::new();
+        let mut batch_idx = start_chunk;
+        while batch_idx < total_chunks {
+            let batch_end = std::cmp::min(batch_idx + GCS_BATCH_CHUNKS as i32, total_chunks);
+            batches.push((batch_idx, batch_end));
+            batch_idx = batch_end;
+        }
+
+        let total_batches = batches.len();
+        let emulator_url = std::env::var("STORAGE_EMULATOR_HOST").ok();
+
+        // Channel for completed batches: (batch_start, data)
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(i32, Vec<u8>)>(GCS_PARALLEL_DOWNLOADS * 2);
+
+        // Semaphore to limit concurrent downloads
+        let semaphore = Arc::new(Semaphore::new(GCS_PARALLEL_DOWNLOADS));
+
+        // Spawn download tasks
+        for (batch_start, batch_end) in batches.iter().copied() {
+            let sem = semaphore.clone();
+            let tx = tx.clone();
+            let bucket = bucket.to_string();
+            let object = object.to_string();
+            let emulator = emulator_url.clone();
+            let store = if emulator.is_none() {
+                Some(self.get_store(&bucket).await?)
+            } else {
+                None
+            };
+
+            let start_byte = batch_start as u64 * chunk_size;
+            let end_byte = if batch_end == total_chunks {
+                total_size
+            } else {
+                batch_end as u64 * chunk_size
+            };
+
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await.unwrap();
+
+                let result = if let Some(ref emu_url) = emulator {
+                    download_range_from_emulator(emu_url, &bucket, &object, start_byte, end_byte).await
+                } else {
+                    let store = store.unwrap();
+                    let path = ObjectPath::from(object.as_str());
+                    store
+                        .get_range(&path, start_byte as usize..end_byte as usize)
+                        .await
+                        .map(|b| b.to_vec())
+                        .map_err(|e| anyhow::anyhow!("{}", e))
                 };
 
-                // Read body in chunks
-                let body = response.bytes().await?;
-                for chunk in body.chunks(256 * 1024) {
-                    sha256_hasher.update(chunk);
-                    writer.write(chunk).await?;
-                    bytes_downloaded += chunk.len() as u64;
-                    throughput_tracker.add_bytes(chunk.len());
-                    on_progress(bytes_downloaded, shard_size, throughput_tracker.get_throughput()).await;
+                match result {
+                    Ok(data) => {
+                        // Send to channel - if receiver is dropped, just exit
+                        let _ = tx.send((batch_start, data)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to download batch {}: {}", batch_start, e);
+                        // Channel will close naturally
+                    }
+                }
+            });
+        }
+
+        // Drop our sender so the channel closes when all spawned tasks complete
+        drop(tx);
+
+        // Buffer for out-of-order batches
+        let mut pending: BTreeMap<i32, Vec<u8>> = BTreeMap::new();
+        let mut next_batch_start = start_chunk;
+        let mut batches_received = 0;
+        let mut total_bytes_downloaded: u64 = 0;
+
+        // Process batches as they arrive, writing in order
+        while let Some((batch_start, data)) = rx.recv().await {
+            batches_received += 1;
+
+            if batch_start == next_batch_start {
+                // This is the next batch we need - write it
+                let batch_end = batches.iter()
+                    .find(|(s, _)| *s == batch_start)
+                    .map(|(_, e)| *e)
+                    .unwrap();
+
+                total_bytes_downloaded += self.write_batch(
+                    job_id, batch_start, batch_end, total_chunks, chunk_size, &data,
+                    total_bytes_downloaded, &download_start, &on_progress
+                ).await?;
+
+                next_batch_start = batch_end;
+
+                // Check if we have subsequent batches buffered
+                while let Some(buffered_data) = pending.remove(&next_batch_start) {
+                    let batch_end = batches.iter()
+                        .find(|(s, _)| *s == next_batch_start)
+                        .map(|(_, e)| *e)
+                        .unwrap();
+
+                    total_bytes_downloaded += self.write_batch(
+                        job_id, next_batch_start, batch_end, total_chunks, chunk_size, &buffered_data,
+                        total_bytes_downloaded, &download_start, &on_progress
+                    ).await?;
+
+                    next_batch_start = batch_end;
                 }
             } else {
-                // Production: use object_store streaming
-                let store = self.get_store(bucket).await?;
-                let path = ObjectPath::from(shard_object.as_str());
-                let result = store.get(&path).await?;
-                let mut stream = result.into_stream();
+                // Out of order - buffer it
+                pending.insert(batch_start, data);
+            }
 
-                let mut bytes_since_flush: u64 = 0;
-                const FLUSH_INTERVAL: u64 = 1 * 1024 * 1024; // Flush every 1MB for piece streaming
-
-                while let Some(chunk_result) = stream.next().await {
-                    let chunk = chunk_result?;
-
-                    sha256_hasher.update(&chunk);
-                    writer.write(&chunk).await?;
-                    bytes_downloaded += chunk.len() as u64;
-                    bytes_since_flush += chunk.len() as u64;
-
-                    // Periodic flush to make data visible to downstream peers
-                    if bytes_since_flush >= FLUSH_INTERVAL {
-                        writer.flush().await?;
-                        bytes_since_flush = 0;
-                    }
-
-                    // Apply rate limiting if configured
-                    if let Some(rate_bps) = self.gcs_bandwidth_limit_bps {
-                        let expected_time = bytes_downloaded as f64 / rate_bps as f64;
-                        let actual_time = download_start.elapsed().as_secs_f64();
-                        if actual_time < expected_time {
-                            tokio::time::sleep(tokio::time::Duration::from_secs_f64(expected_time - actual_time)).await;
-                        }
-                    }
-
-                    throughput_tracker.add_bytes(chunk.len());
-                    on_progress(bytes_downloaded, shard_size, throughput_tracker.get_throughput()).await;
+            // Rate limiting (for testing)
+            if let Some(rate_bps) = self.gcs_bandwidth_limit_bps {
+                let expected_time = total_bytes_downloaded as f64 / rate_bps as f64;
+                let actual_time = download_start.elapsed().as_secs_f64();
+                if actual_time < expected_time {
+                    tokio::time::sleep(tokio::time::Duration::from_secs_f64(expected_time - actual_time)).await;
                 }
             }
-            Ok(())
-        }.await;
-
-        // Handle download errors
-        if let Err(e) = download_result {
-            tracing::warn!("GCS download error for shard {}: {} - will retry", shard_id, e);
-            self.storage.abort_partial(job_id, shard_id).await?;
-            return Ok(false);
         }
 
-        // Flush buffered data before finalizing
-        if let Err(e) = writer.flush().await {
-            tracing::warn!("Failed to flush shard {}: {} - will retry", shard_id, e);
-            self.storage.abort_partial(job_id, shard_id).await?;
-            return Ok(false);
+        // Check if we got all batches
+        if batches_received != total_batches {
+            anyhow::bail!("Only received {}/{} batches", batches_received, total_batches);
         }
 
-        // Verify we got the expected size
-        if bytes_downloaded != shard_size {
-            tracing::warn!(
-                "Shard {} size mismatch: expected {}, got {} - will retry",
-                shard_id, shard_size, bytes_downloaded
-            );
-            self.storage.abort_partial(job_id, shard_id).await?;
-            return Ok(false);
-        }
-
-        // Verify SHA256 (TODO: compare against manifest)
-        let computed_sha256 = hex::encode(sha256_hasher.finalize());
-        tracing::info!("Shard {} SHA256: {} ({} bytes)", shard_id, computed_sha256, bytes_downloaded);
-
-        // Finalize the shard
-        self.storage.finalize_shard(job_id, shard_id).await?;
+        let elapsed = download_start.elapsed();
+        let throughput_mbps = (total_bytes_downloaded as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
+        tracing::info!(
+            "Downloaded {} bytes in {:.1}s ({:.1} Mbit/s)",
+            total_bytes_downloaded, elapsed.as_secs_f64(), throughput_mbps
+        );
 
         Ok(true)
     }
 
-    /// Download a shard from GCS using parallel range requests
-    /// This downloads N ranges in parallel, collects them in memory, verifies SHA256,
-    /// then writes to disk. Much faster than single-stream for high-bandwidth connections.
-    pub async fn download_shard_from_gcs_parallel<F, Fut>(
+    /// Helper to write a batch to storage and report progress
+    async fn write_batch<F, Fut>(
         &self,
         job_id: Uuid,
-        gcs_base_path: &str,
-        shard_path: &str,
-        shard_id: i32,
-        shard_size: u64,
-        on_progress: F,
-    ) -> anyhow::Result<bool>
+        batch_start: i32,
+        batch_end: i32,
+        total_chunks: i32,
+        chunk_size: u64,
+        data: &[u8],
+        bytes_so_far: u64,
+        download_start: &std::time::Instant,
+        on_progress: &F,
+    ) -> anyhow::Result<u64>
     where
-        F: Fn(u64, u64, Option<u64>) -> Fut + Send + Sync,
+        F: Fn(i32, i32, u64, Option<u64>) -> Fut + Send + Sync,
         Fut: Future<Output = ()> + Send,
     {
-        let (bucket, object_path) = parse_gcs_path(gcs_base_path)?;
-        let shard_object = format!("{}/{}", object_path, shard_path);
+        let mut bytes_written = 0u64;
 
-        // Get parallelism from env var or use default
-        let num_ranges = std::env::var("GCS_PARALLEL_RANGES")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_GCS_PARALLEL_RANGES);
+        for chunk_id in batch_start..batch_end {
+            let offset_in_batch = ((chunk_id - batch_start) as u64 * chunk_size) as usize;
+            let chunk_end_offset = if chunk_id == total_chunks - 1 {
+                data.len()
+            } else {
+                std::cmp::min(offset_in_batch + chunk_size as usize, data.len())
+            };
 
-        tracing::info!(
-            "Downloading shard {} from GCS (parallel, {} ranges): gs://{}/{}",
-            shard_id, num_ranges, bucket, shard_object
-        );
+            let chunk_data = &data[offset_in_batch..chunk_end_offset];
+            self.storage.append_chunk(job_id, chunk_data).await?;
 
-        let download_start = std::time::Instant::now();
+            bytes_written += chunk_data.len() as u64;
+            let total = bytes_so_far + bytes_written;
 
-        // Get the object store
-        let store = self.get_store(bucket).await?;
-        let path = ObjectPath::from(shard_object.as_str());
+            let elapsed = download_start.elapsed().as_secs_f64();
+            let throughput = if elapsed > 0.0 {
+                Some((total as f64 / elapsed) as u64)
+            } else {
+                None
+            };
 
-        // Calculate ranges
-        let ranges = calculate_ranges(shard_size, num_ranges);
-
-        // Track bytes downloaded across all ranges for progress reporting
-        let bytes_downloaded = Arc::new(AtomicU64::new(0));
-
-        // Download all ranges in parallel
-        let handles: Vec<_> = ranges
-            .into_iter()
-            .enumerate()
-            .map(|(idx, range)| {
-                let store = store.clone();
-                let path = path.clone();
-                let bytes_downloaded = bytes_downloaded.clone();
-                let range_len = (range.end - range.start) as u64;
-                tokio::spawn(async move {
-                    let data = store.get_range(&path, range.clone()).await?;
-                    // Update progress when this range completes
-                    bytes_downloaded.fetch_add(range_len, Ordering::Relaxed);
-                    Ok::<_, anyhow::Error>((idx, data.to_vec()))
-                })
-            })
-            .collect();
-
-        // Collect results in order, reporting progress as each range completes
-        let mut range_results: Vec<Option<Vec<u8>>> = vec![None; handles.len()];
-        for handle in handles {
-            match handle.await {
-                Ok(Ok((idx, data))) => {
-                    range_results[idx] = Some(data);
-                    // Report progress after each range completes
-                    let current_bytes = bytes_downloaded.load(Ordering::Relaxed);
-                    on_progress(current_bytes, shard_size, None).await;
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        "GCS range download error for shard {}: {} - will retry",
-                        shard_id, e
-                    );
-                    return Ok(false);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "GCS range download task panic for shard {}: {} - will retry",
-                        shard_id, e
-                    );
-                    return Ok(false);
-                }
-            }
+            on_progress(chunk_id, total_chunks, total, throughput).await;
         }
 
-        // Concatenate all ranges
-        let mut all_data = Vec::with_capacity(shard_size as usize);
-        for (idx, range_data) in range_results.into_iter().enumerate() {
-            match range_data {
-                Some(data) => all_data.extend_from_slice(&data),
-                None => {
-                    tracing::warn!(
-                        "Missing range {} for shard {} - will retry",
-                        idx, shard_id
-                    );
-                    return Ok(false);
-                }
-            }
-        }
-
-        // Verify size
-        if all_data.len() as u64 != shard_size {
-            tracing::warn!(
-                "Shard {} size mismatch: expected {}, got {} - will retry",
-                shard_id, shard_size, all_data.len()
-            );
-            return Ok(false);
-        }
-
-        // Compute SHA256
-        let mut sha256_hasher = Sha256::new();
-        sha256_hasher.update(&all_data);
-        let computed_sha256 = hex::encode(sha256_hasher.finalize());
-
-        let download_elapsed = download_start.elapsed();
-        let throughput_mbps = (shard_size as f64 * 8.0) / download_elapsed.as_secs_f64() / 1_000_000.0;
-        tracing::info!(
-            "Shard {} SHA256: {} ({} bytes, {:.1} Mbit/s)",
-            shard_id, computed_sha256, shard_size, throughput_mbps
-        );
-
-        // Write to disk
-        let mut writer = self.storage.start_partial_shard_writer(job_id, shard_id).await?;
-        if let Err(e) = writer.write(&all_data).await {
-            tracing::warn!("Failed to write shard {} data: {} - will retry", shard_id, e);
-            self.storage.abort_partial(job_id, shard_id).await?;
-            return Ok(false);
-        }
-        if let Err(e) = writer.flush().await {
-            tracing::warn!("Failed to flush shard {}: {} - will retry", shard_id, e);
-            self.storage.abort_partial(job_id, shard_id).await?;
-            return Ok(false);
-        }
-
-        // Finalize the shard
-        self.storage.finalize_shard(job_id, shard_id).await?;
-
-        // Report final progress
-        on_progress(shard_size, shard_size, Some((shard_size as f64 / download_elapsed.as_secs_f64()) as u64)).await;
-
-        Ok(true)
+        Ok(bytes_written)
     }
 
-    /// Download a shard from a peer via gRPC streaming
-    /// The client should be created once and reused for multiple shards
-    pub async fn download_shard_from_peer<F, Fut>(
+    /// Download chunks from a peer via gRPC streaming
+    pub async fn download_chunks_from_peer<F, Fut>(
         &self,
         client: &mut PeerClient,
         job_id: Uuid,
-        shard_id: i32,
-        shard_size: u64,
+        start_from_chunk: i32,
+        total_chunks: i32,
+        chunk_size: u64,
+        total_size: u64,
         on_progress: F,
     ) -> anyhow::Result<bool>
     where
-        F: Fn(u64, u64, Option<u64>) -> Fut + Send + Sync,
+        F: Fn(i32, i32, u64, Option<u64>) -> Fut + Send + Sync,
         Fut: Future<Output = ()> + Send,
     {
-        let request = ShardRequest {
+        let request = ChunkRequest {
             job_id: job_id.to_string(),
-            from_shard: shard_id,
-            from_piece: 0, // Pieces are now just transfer chunks
+            start_from_chunk_id: start_from_chunk,
         };
 
-        let mut stream = match client.stream_shards(request).await {
+        let mut stream = match client.stream_chunks(request).await {
             Ok(response) => response.into_inner(),
             Err(e) => {
-                tracing::warn!("Failed to start stream from peer: {} - will retry", e);
+                tracing::warn!("Failed to start chunk stream from peer: {} - will retry", e);
                 return Ok(false);
             }
         };
 
-        // DON'T create partial file yet - wait until we receive actual data
-        // This prevents downstream peers from seeing an empty partial file
-        let mut partial_started = false;
-
-        let mut sha256_hasher = Sha256::new();
-        let mut bytes_downloaded: u64 = 0;
-        let mut throughput_tracker = ThroughputTracker::new();
         let download_start = std::time::Instant::now();
+        let mut total_bytes_downloaded: u64 = 0;
+        let mut last_chunk_received = start_from_chunk - 1;
 
         loop {
             let chunk_data = match stream.message().await {
@@ -447,119 +349,115 @@ impl Downloader {
                 Ok(None) => break, // Stream ended normally
                 Err(e) => {
                     tracing::warn!("Peer stream error: {} - will retry", e);
-                    if partial_started {
-                        self.storage.abort_partial(job_id, shard_id).await?;
-                    }
                     return Ok(false);
                 }
             };
-
-            // Verify this chunk belongs to our shard
-            if chunk_data.shard_id != shard_id {
-                tracing::warn!("Received chunk for wrong shard {} (expected {})", chunk_data.shard_id, shard_id);
-                continue;
-            }
 
             // Verify CRC32C
             let actual_crc32c = compute_crc32c(&chunk_data.data);
             if actual_crc32c != chunk_data.crc32c {
                 tracing::warn!(
-                    "CRC32C mismatch for chunk: expected {:08x}, got {:08x} - will retry shard",
-                    chunk_data.crc32c,
-                    actual_crc32c
+                    "CRC32C mismatch for chunk {}: expected {:08x}, got {:08x} - will retry",
+                    chunk_data.chunk_id, chunk_data.crc32c, actual_crc32c
                 );
-                self.storage.abort_partial(job_id, shard_id).await?;
                 return Ok(false);
             }
 
-            // Update SHA256
-            sha256_hasher.update(&chunk_data.data);
+            // Calculate the correct chunk size for this chunk
+            let expected_chunk_size = if chunk_data.chunk_id == total_chunks - 1 {
+                // Last chunk may be smaller
+                let remainder = total_size % chunk_size;
+                if remainder == 0 { chunk_size } else { remainder }
+            } else {
+                chunk_size
+            };
 
-            // Start partial file on first chunk (so downstream peers only see it when we have data)
-            if !partial_started {
-                self.storage.start_partial_shard(job_id, shard_id).await?;
-                partial_started = true;
-            }
-
-            // Append to partial file
-            if let Err(e) = self.storage.append_to_partial(job_id, shard_id, &chunk_data.data).await {
-                tracing::warn!("Failed to write chunk: {} - will retry", e);
-                self.storage.abort_partial(job_id, shard_id).await?;
+            if chunk_data.data.len() as u64 != expected_chunk_size {
+                tracing::warn!(
+                    "Chunk {} size mismatch: expected {}, got {}",
+                    chunk_data.chunk_id, expected_chunk_size, chunk_data.data.len()
+                );
                 return Ok(false);
             }
 
-            bytes_downloaded += chunk_data.data.len() as u64;
+            // Append chunk to storage
+            self.storage.append_chunk(job_id, &chunk_data.data).await?;
 
-            // Apply P2P rate limiting if configured
+            total_bytes_downloaded += chunk_data.data.len() as u64;
+            last_chunk_received = chunk_data.chunk_id;
+
+            // Rate limiting
             if let Some(rate_bps) = self.p2p_bandwidth_limit_bps {
-                let expected_time = bytes_downloaded as f64 / rate_bps as f64;
+                let expected_time = total_bytes_downloaded as f64 / rate_bps as f64;
                 let actual_time = download_start.elapsed().as_secs_f64();
                 if actual_time < expected_time {
                     tokio::time::sleep(tokio::time::Duration::from_secs_f64(expected_time - actual_time)).await;
                 }
             }
 
-            // Track throughput
-            throughput_tracker.add_bytes(chunk_data.data.len());
+            // Calculate throughput
+            let elapsed = download_start.elapsed().as_secs_f64();
+            let throughput = if elapsed > 0.0 {
+                Some((total_bytes_downloaded as f64 / elapsed) as u64)
+            } else {
+                None
+            };
 
-            // Report progress
-            on_progress(bytes_downloaded, shard_size, throughput_tracker.get_throughput()).await;
+            on_progress(chunk_data.chunk_id, total_chunks, total_bytes_downloaded, throughput).await;
 
-            // Check if we've received the complete shard
-            if bytes_downloaded >= shard_size {
+            // Check if we've received all chunks
+            if last_chunk_received >= total_chunks - 1 {
                 break;
             }
         }
 
-        // Verify we got the expected size
-        if bytes_downloaded != shard_size {
+        // Verify we got all expected chunks
+        if last_chunk_received < total_chunks - 1 {
             tracing::warn!(
-                "Shard {} size mismatch: expected {}, got {} - will retry",
-                shard_id, shard_size, bytes_downloaded
+                "Incomplete download: only received up to chunk {} of {}",
+                last_chunk_received, total_chunks - 1
             );
-            if partial_started {
-                self.storage.abort_partial(job_id, shard_id).await?;
-            }
             return Ok(false);
         }
 
-        // Verify SHA256 (TODO: compare against manifest)
-        let computed_sha256 = hex::encode(sha256_hasher.finalize());
-        tracing::info!("Shard {} SHA256: {} ({} bytes from peer)", shard_id, computed_sha256, bytes_downloaded);
-
-        // Finalize the shard
-        self.storage.finalize_shard(job_id, shard_id).await?;
+        let elapsed = download_start.elapsed();
+        let throughput_mbps = (total_bytes_downloaded as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
+        tracing::info!(
+            "Downloaded {} bytes from peer in {:.1}s ({:.1} Mbit/s)",
+            total_bytes_downloaded, elapsed.as_secs_f64(), throughput_mbps
+        );
 
         Ok(true)
     }
 }
 
-/// Tracks throughput using total bytes and elapsed time
-struct ThroughputTracker {
-    total_bytes: u64,
-    start_time: std::time::Instant,
-}
+/// Download a byte range from the GCS emulator
+async fn download_range_from_emulator(
+    emulator_url: &str,
+    bucket: &str,
+    object: &str,
+    start_byte: u64,
+    end_byte: u64,
+) -> anyhow::Result<Vec<u8>> {
+    let url = format!(
+        "{}/storage/v1/b/{}/o/{}?alt=media",
+        emulator_url,
+        bucket,
+        urlencoding::encode(object)
+    );
 
-impl ThroughputTracker {
-    fn new() -> Self {
-        Self {
-            total_bytes: 0,
-            start_time: std::time::Instant::now(),
-        }
+    let client = reqwest::Client::new();
+    let response = client
+        .get(&url)
+        .header("Range", format!("bytes={}-{}", start_byte, end_byte - 1))
+        .send()
+        .await?;
+
+    if !response.status().is_success() && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        anyhow::bail!("GCS emulator HTTP {}", response.status());
     }
 
-    fn add_bytes(&mut self, bytes: usize) {
-        self.total_bytes += bytes as u64;
-    }
-
-    fn get_throughput(&self) -> Option<u64> {
-        let elapsed = self.start_time.elapsed().as_secs_f64();
-        if elapsed > 0.0 {
-            Some((self.total_bytes as f64 / elapsed) as u64)
-        } else {
-            None
-        }
-    }
+    Ok(response.bytes().await?.to_vec())
 }
 
 /// Parse a GCS path into bucket and object path
@@ -593,20 +491,4 @@ fn parse_bandwidth_limit(s: &str) -> Option<u64> {
     };
 
     num_str.parse::<u64>().ok().map(|n| n * multiplier)
-}
-
-/// Calculate byte ranges for parallel download
-fn calculate_ranges(total_size: u64, num_ranges: usize) -> Vec<Range<usize>> {
-    let range_size = total_size / num_ranges as u64;
-    (0..num_ranges)
-        .map(|i| {
-            let start = i as u64 * range_size;
-            let end = if i == num_ranges - 1 {
-                total_size
-            } else {
-                (i + 1) as u64 * range_size
-            };
-            (start as usize)..(end as usize)
-        })
-        .collect()
 }

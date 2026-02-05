@@ -1,48 +1,16 @@
+use std::io::SeekFrom;
 use std::path::PathBuf;
 use tokio::fs::{self, File, OpenOptions};
-use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
-/// Buffered writer for streaming shard data efficiently
-pub struct ShardWriter {
-    writer: BufWriter<File>,
-}
-
-impl ShardWriter {
-    /// Write a chunk of data
-    pub async fn write(&mut self, data: &[u8]) -> anyhow::Result<()> {
-        self.writer.write_all(data).await?;
-        Ok(())
-    }
-
-    /// Flush any buffered data (call before finalize)
-    pub async fn flush(&mut self) -> anyhow::Result<()> {
-        self.writer.flush().await?;
-        Ok(())
-    }
-}
-
-pub struct ShardStorage {
+pub struct ChunkStorage {
     data_dir: PathBuf,
 }
 
-impl ShardStorage {
+impl ChunkStorage {
     pub fn new(data_dir: PathBuf) -> Self {
         Self { data_dir }
-    }
-
-    /// Get the path for a complete shard file
-    fn shard_path(&self, job_id: Uuid, shard_id: i32) -> PathBuf {
-        self.data_dir
-            .join(job_id.to_string())
-            .join(format!("shard_{:04}.bin", shard_id))
-    }
-
-    /// Get the path for a partial (in-progress) shard file
-    fn partial_path(&self, job_id: Uuid, shard_id: i32) -> PathBuf {
-        self.data_dir
-            .join(job_id.to_string())
-            .join(format!("shard_{:04}.bin.partial", shard_id))
     }
 
     /// Get the job directory path
@@ -50,185 +18,205 @@ impl ShardStorage {
         self.data_dir.join(job_id.to_string())
     }
 
+    /// Output file path for a job (partial during download)
+    fn output_partial_path(&self, job_id: Uuid) -> PathBuf {
+        self.job_dir(job_id).join("output.bin.partial")
+    }
+
+    /// Output file path for a job (final)
+    fn output_path(&self, job_id: Uuid) -> PathBuf {
+        self.job_dir(job_id).join("output.bin")
+    }
+
     /// Ensure job directory exists
-    pub async fn ensure_job_dir(&self, job_id: Uuid) -> anyhow::Result<()> {
+    async fn ensure_job_dir(&self, job_id: Uuid) -> anyhow::Result<()> {
         let dir = self.job_dir(job_id);
         fs::create_dir_all(&dir).await?;
         Ok(())
     }
 
-    /// Start a new partial shard (removes any existing partial file)
-    pub async fn start_partial_shard(&self, job_id: Uuid, shard_id: i32) -> anyhow::Result<()> {
+    /// Get file size of output file (partial or final)
+    async fn get_file_size(&self, job_id: Uuid) -> u64 {
+        let partial_path = self.output_partial_path(job_id);
+        let final_path = self.output_path(job_id);
+
+        if let Ok(meta) = fs::metadata(&final_path).await {
+            return meta.len();
+        }
+        if let Ok(meta) = fs::metadata(&partial_path).await {
+            return meta.len();
+        }
+        0
+    }
+
+    /// Check if the job is initialized (output file exists)
+    pub async fn is_initialized(&self, job_id: Uuid) -> bool {
+        let partial = self.output_partial_path(job_id);
+        let final_path = self.output_path(job_id);
+        fs::try_exists(&partial).await.unwrap_or(false) ||
+            fs::try_exists(&final_path).await.unwrap_or(false)
+    }
+
+    /// Initialize output file (create empty file, truncate any partial data to chunk boundary)
+    pub async fn initialize(&self, job_id: Uuid, chunk_size: u64) -> anyhow::Result<()> {
         self.ensure_job_dir(job_id).await?;
-        let partial_path = self.partial_path(job_id, shard_id);
-        // Remove existing partial if any
-        let _ = fs::remove_file(&partial_path).await;
-        // Create empty file
-        File::create(&partial_path).await?;
-        Ok(())
-    }
+        let path = self.output_partial_path(job_id);
 
-    /// Start a new partial shard and return a buffered writer for efficient streaming
-    pub async fn start_partial_shard_writer(&self, job_id: Uuid, shard_id: i32) -> anyhow::Result<ShardWriter> {
-        self.ensure_job_dir(job_id).await?;
-        let partial_path = self.partial_path(job_id, shard_id);
-        // Remove existing partial if any
-        let _ = fs::remove_file(&partial_path).await;
-        // Create file with buffered writer (256KB buffer)
-        let file = File::create(&partial_path).await?;
-        let writer = BufWriter::with_capacity(256 * 1024, file);
-        Ok(ShardWriter { writer })
-    }
-
-    /// Append data to a partial shard
-    pub async fn append_to_partial(&self, job_id: Uuid, shard_id: i32, data: &[u8]) -> anyhow::Result<()> {
-        let partial_path = self.partial_path(job_id, shard_id);
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&partial_path)
-            .await?;
-        file.write_all(data).await?;
-        // Note: no flush() - OS buffering makes data visible for piece streaming
-        // and avoids disk I/O overhead on every chunk
-        Ok(())
-    }
-
-    /// Finalize a partial shard by renaming it to the complete shard path
-    /// Call this after SHA256 verification passes
-    pub async fn finalize_shard(&self, job_id: Uuid, shard_id: i32) -> anyhow::Result<()> {
-        let partial_path = self.partial_path(job_id, shard_id);
-        let shard_path = self.shard_path(job_id, shard_id);
-        fs::rename(&partial_path, &shard_path).await?;
-        Ok(())
-    }
-
-    /// Abort a partial shard download (delete the partial file)
-    pub async fn abort_partial(&self, job_id: Uuid, shard_id: i32) -> anyhow::Result<()> {
-        let partial_path = self.partial_path(job_id, shard_id);
-        let _ = fs::remove_file(&partial_path).await;
-        Ok(())
-    }
-
-    /// Check if a complete shard exists
-    pub async fn shard_exists(&self, job_id: Uuid, shard_id: i32) -> bool {
-        let path = self.shard_path(job_id, shard_id);
-        fs::try_exists(&path).await.unwrap_or(false)
-    }
-
-    /// Read a complete shard from storage
-    pub async fn read_shard(&self, job_id: Uuid, shard_id: i32) -> anyhow::Result<Vec<u8>> {
-        let path = self.shard_path(job_id, shard_id);
-        let data = fs::read(&path).await?;
-        Ok(data)
-    }
-
-    /// Check if a partial shard exists
-    pub async fn partial_exists(&self, job_id: Uuid, shard_id: i32) -> bool {
-        let path = self.partial_path(job_id, shard_id);
-        fs::try_exists(&path).await.unwrap_or(false)
-    }
-
-    /// Get the current size of a partial shard (bytes written so far)
-    pub async fn get_partial_size(&self, job_id: Uuid, shard_id: i32) -> anyhow::Result<u64> {
-        let path = self.partial_path(job_id, shard_id);
-        let metadata = fs::metadata(&path).await?;
-        Ok(metadata.len())
-    }
-
-    /// Get the size of a complete shard (without reading it into memory)
-    pub async fn get_shard_size(&self, job_id: Uuid, shard_id: i32) -> anyhow::Result<u64> {
-        let path = self.shard_path(job_id, shard_id);
-        let metadata = fs::metadata(&path).await?;
-        Ok(metadata.len())
-    }
-
-    /// Read a range from a partial or complete shard
-    /// Returns the data read (may be less than requested if at end of file)
-    /// Handles race condition where partial file is renamed to complete during read
-    pub async fn read_shard_range(
-        &self,
-        job_id: Uuid,
-        shard_id: i32,
-        offset: u64,
-        length: usize,
-    ) -> anyhow::Result<Vec<u8>> {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-        // Try complete shard first, then partial, handle race condition
-        let shard_path = self.shard_path(job_id, shard_id);
-        let partial_path = self.partial_path(job_id, shard_id);
-
-        let file = match File::open(&shard_path).await {
-            Ok(f) => f,
-            Err(_) => match File::open(&partial_path).await {
-                Ok(f) => f,
-                Err(_) => {
-                    // One more try on complete shard (race: partial was just renamed)
-                    File::open(&shard_path).await?
-                }
+        if fs::try_exists(&path).await.unwrap_or(false) {
+            // File exists - truncate to last complete chunk boundary for crash recovery
+            let meta = fs::metadata(&path).await?;
+            let current_size = meta.len();
+            let complete_size = (current_size / chunk_size) * chunk_size;
+            if complete_size < current_size {
+                tracing::info!(
+                    "Truncating partial chunk for job {}: {} -> {} bytes",
+                    job_id, current_size, complete_size
+                );
+                let file = OpenOptions::new().write(true).open(&path).await?;
+                file.set_len(complete_size).await?;
             }
+        } else {
+            // Create new empty file
+            File::create(&path).await?;
+            tracing::info!("Created output file for job {}", job_id);
+        }
+        Ok(())
+    }
+
+    /// Append chunk to output file (sequential writes only)
+    pub async fn append_chunk(&self, job_id: Uuid, data: &[u8]) -> anyhow::Result<()> {
+        let partial_path = self.output_partial_path(job_id);
+        let final_path = self.output_path(job_id);
+
+        let path = if fs::try_exists(&partial_path).await.unwrap_or(false) {
+            partial_path
+        } else if fs::try_exists(&final_path).await.unwrap_or(false) {
+            final_path
+        } else {
+            anyhow::bail!("No output file exists for job {}", job_id);
         };
 
-        let mut file = file;
-        file.seek(std::io::SeekFrom::Start(offset)).await?;
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .await?;
+
+        file.write_all(data).await?;
+        // Sync to ensure data is persisted
+        file.sync_data().await?;
+
+        Ok(())
+    }
+
+    /// Check if a chunk is complete (based on file size)
+    pub async fn is_chunk_complete(&self, job_id: Uuid, chunk_id: i32, chunk_size: u64, total_size: u64) -> bool {
+        let file_size = self.get_file_size(job_id).await;
+        // Calculate where this chunk ends
+        let chunk_end = (chunk_id as u64 + 1) * chunk_size;
+        // For the last chunk, the end is total_size (which may be less than chunk boundary)
+        let actual_chunk_end = std::cmp::min(chunk_end, total_size);
+        file_size >= actual_chunk_end
+    }
+
+    /// Get last completed chunk based on file size
+    pub async fn get_last_completed_chunk(&self, job_id: Uuid, chunk_size: u64) -> i32 {
+        let file_size = self.get_file_size(job_id).await;
+        if file_size == 0 || chunk_size == 0 {
+            return -1;
+        }
+        (file_size / chunk_size) as i32 - 1
+    }
+
+    /// Read range from output file (for P2P serving)
+    pub async fn read_range(&self, job_id: Uuid, offset: u64, length: usize) -> anyhow::Result<Vec<u8>> {
+        // Try final file first, then partial
+        let final_path = self.output_path(job_id);
+        let partial_path = self.output_partial_path(job_id);
+
+        let path = if fs::try_exists(&final_path).await.unwrap_or(false) {
+            final_path
+        } else if fs::try_exists(&partial_path).await.unwrap_or(false) {
+            partial_path
+        } else {
+            anyhow::bail!("No output file exists for job {}", job_id);
+        };
+
+        let mut file = File::open(&path).await?;
+        file.seek(SeekFrom::Start(offset)).await?;
 
         let mut buffer = vec![0u8; length];
-        let bytes_read = file.read(&mut buffer).await?;
-        buffer.truncate(bytes_read);
+        file.read_exact(&mut buffer).await?;
 
         Ok(buffer)
     }
 
-    /// Get the last completed shard for a job (-1 if none)
-    /// Also cleans up any partial files on startup
-    pub async fn get_last_completed_shard(&self, job_id: Uuid) -> i32 {
-        let dir = self.job_dir(job_id);
-        if !dir.exists() {
-            return -1;
+    /// Finalize (rename partial to final)
+    pub async fn finalize(&self, job_id: Uuid) -> anyhow::Result<()> {
+        let partial_path = self.output_partial_path(job_id);
+        let final_path = self.output_path(job_id);
+
+        if fs::try_exists(&partial_path).await.unwrap_or(false) {
+            fs::rename(&partial_path, &final_path).await?;
+            tracing::info!("Finalized output file for job {}", job_id);
         }
 
-        // Clean up any partial files first (incomplete downloads from previous run)
-        if let Ok(mut entries) = fs::read_dir(&dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(name) = entry.file_name().to_str() {
-                    if name.ends_with(".partial") {
-                        let _ = fs::remove_file(entry.path()).await;
-                        tracing::info!("Cleaned up partial file: {}", name);
-                    }
-                }
-            }
+        Ok(())
+    }
+
+    /// Verify file CRC32C
+    pub async fn verify_crc32c(&self, job_id: Uuid, expected: &str) -> anyhow::Result<bool> {
+        if expected.is_empty() {
+            // No CRC32C to verify (e.g., emulator doesn't provide it)
+            tracing::warn!("No CRC32C to verify for job {}", job_id);
+            return Ok(true);
         }
 
-        // Find the highest completed shard with continuous sequence from 0
-        let mut max_complete_shard = -1i32;
-
-        // First pass: find all complete shards
-        let mut complete_shards = Vec::new();
-        if let Ok(mut entries) = fs::read_dir(&dir).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                if let Some(name) = entry.file_name().to_str() {
-                    // Parse shard_XXXX.bin format (not .partial)
-                    if name.starts_with("shard_") && name.ends_with(".bin") && !name.ends_with(".partial") {
-                        if let Some(shard_id) = name.get(6..10).and_then(|s| s.parse::<i32>().ok()) {
-                            complete_shards.push(shard_id);
-                        }
-                    }
-                }
-            }
+        let path = self.output_path(job_id);
+        if !fs::try_exists(&path).await.unwrap_or(false) {
+            anyhow::bail!("Output file not found for job {}", job_id);
         }
 
-        // Sort and find the last continuous shard from 0
-        complete_shards.sort();
-        for (expected, &actual) in complete_shards.iter().enumerate() {
-            if actual != expected as i32 {
-                // Gap found, return previous
+        // Read file in chunks and compute CRC32C
+        let mut file = File::open(&path).await?;
+        let mut hasher = 0u32;
+        let mut buffer = vec![0u8; 1024 * 1024]; // 1MB buffer
+
+        loop {
+            let bytes_read = file.read(&mut buffer).await?;
+            if bytes_read == 0 {
                 break;
             }
-            max_complete_shard = actual;
+            hasher = crc32c::crc32c_append(hasher, &buffer[..bytes_read]);
         }
 
-        max_complete_shard
+        // GCS stores CRC32C as base64-encoded big-endian bytes
+        let expected_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            expected,
+        )?;
+
+        if expected_bytes.len() != 4 {
+            anyhow::bail!("Invalid CRC32C length: {}", expected_bytes.len());
+        }
+
+        let expected_crc = u32::from_be_bytes([
+            expected_bytes[0],
+            expected_bytes[1],
+            expected_bytes[2],
+            expected_bytes[3],
+        ]);
+
+        let verified = hasher == expected_crc;
+        if verified {
+            tracing::info!("CRC32C verified for job {} ({})", job_id, expected);
+        } else {
+            tracing::error!(
+                "CRC32C mismatch for job {}: expected {:08x}, got {:08x}",
+                job_id, expected_crc, hasher
+            );
+        }
+
+        Ok(verified)
     }
 
     /// Delete all data for a job (used when job is purged)

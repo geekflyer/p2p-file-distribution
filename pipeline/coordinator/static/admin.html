@@ -1,56 +1,258 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Pipeline - Admin Dashboard</title>
     <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; padding: 20px; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        h1 { margin-bottom: 20px; color: #333; }
-        h2 { margin: 20px 0 10px; color: #555; font-size: 1.2em; }
-        .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: 500; }
-        input[type="text"], input[type="number"] { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
-        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-size: 14px; }
-        button:hover { background: #0056b3; }
-        button:disabled { background: #ccc; cursor: not-allowed; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { text-align: left; padding: 12px; border-bottom: 1px solid #eee; }
-        th { background: #f8f9fa; font-weight: 600; }
-        .status { padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500; }
-        .status.healthy, .status.completed { background: #d4edda; color: #155724; }
-        .status.unhealthy, .status.failed { background: #f8d7da; color: #721c24; }
-        .status.created { background: #e2e3e5; color: #383d41; }
-        .status.in_progress { background: #cce5ff; color: #004085; }
-        .status.purged { background: #f5f5f5; color: #6c757d; }
-        .status.cancelled { background: #fff3cd; color: #856404; }
-        .btn-danger { background: #dc3545; margin-left: 5px; }
-        .btn-danger:hover { background: #c82333; }
-        .btn-small { padding: 5px 10px; font-size: 12px; }
-        .progress-bar { width: 100%; height: 20px; background: #e9ecef; border-radius: 4px; overflow: hidden; }
-        .progress-fill { height: 100%; background: #28a745; transition: width 0.3s; }
-        .refresh-btn { background: #6c757d; margin-left: 10px; }
-        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-        .error { color: #dc3545; margin-top: 10px; }
-        .success { color: #28a745; margin-top: 10px; }
-        .throughput { color: #6c757d; font-size: 12px; }
-        .job-summary { margin-bottom: 15px; padding: 10px; background: #f8f9fa; border-radius: 4px; }
-        .job-summary span { margin-right: 20px; }
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #f5f5f5;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+            color: #333;
+        }
+
+        h2 {
+            margin: 20px 0 10px;
+            color: #555;
+            font-size: 1.2em;
+        }
+
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: 500;
+        }
+
+        input[type="text"],
+        input[type="number"] {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+
+        button {
+            background: #007bff;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        button:hover {
+            background: #0056b3;
+        }
+
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        th,
+        td {
+            text-align: left;
+            padding: 12px;
+            border-bottom: 1px solid #eee;
+        }
+
+        th {
+            background: #f8f9fa;
+            font-weight: 600;
+        }
+
+        .status {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+
+        .status.healthy,
+        .status.completed {
+            background: #d4edda;
+            color: #155724;
+        }
+
+        .status.unhealthy,
+        .status.failed {
+            background: #f8d7da;
+            color: #721c24;
+        }
+
+        .status.created {
+            background: #e2e3e5;
+            color: #383d41;
+        }
+
+        .status.in_progress {
+            background: #cce5ff;
+            color: #004085;
+        }
+
+        .status.purged {
+            background: #f5f5f5;
+            color: #6c757d;
+        }
+
+        .status.cancelled {
+            background: #fff3cd;
+            color: #856404;
+        }
+
+        .btn-danger {
+            background: #dc3545;
+            margin-left: 5px;
+        }
+
+        .btn-danger:hover {
+            background: #c82333;
+        }
+
+        .btn-small {
+            padding: 5px 10px;
+            font-size: 12px;
+        }
+
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background: #e9ecef;
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: #28a745;
+            transition: width 0.3s;
+        }
+
+        .refresh-btn {
+            background: #6c757d;
+            margin-left: 10px;
+        }
+
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .error {
+            color: #dc3545;
+            margin-top: 10px;
+        }
+
+        .success {
+            color: #28a745;
+            margin-top: 10px;
+        }
+
+        .throughput {
+            color: #6c757d;
+            font-size: 12px;
+        }
+
+        .job-summary {
+            margin-bottom: 15px;
+            padding: 10px;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }
+
+        .job-summary span {
+            margin-right: 20px;
+        }
 
         /* Tabs */
-        .tabs { display: flex; border-bottom: 2px solid #dee2e6; margin-bottom: 20px; }
-        .tab { padding: 12px 24px; cursor: pointer; border: none; background: none; font-size: 16px; font-weight: 500; color: #6c757d; border-bottom: 2px solid transparent; margin-bottom: -2px; }
-        .tab:hover { color: #333; }
-        .tab.active { color: #007bff; border-bottom-color: #007bff; }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-        .tab-badge { background: #6c757d; color: white; padding: 2px 8px; border-radius: 10px; font-size: 12px; margin-left: 8px; }
-        .tab.active .tab-badge { background: #007bff; }
+        .tabs {
+            display: flex;
+            border-bottom: 2px solid #dee2e6;
+            margin-bottom: 20px;
+        }
+
+        .tab {
+            padding: 12px 24px;
+            cursor: pointer;
+            border: none;
+            background: none;
+            font-size: 16px;
+            font-weight: 500;
+            color: #6c757d;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+        }
+
+        .tab:hover {
+            color: #333;
+        }
+
+        .tab.active {
+            color: #007bff;
+            border-bottom-color: #007bff;
+        }
+
+        .tab-content {
+            display: none;
+        }
+
+        .tab-content.active {
+            display: block;
+        }
+
+        .tab-badge {
+            background: #6c757d;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 12px;
+            margin-left: 8px;
+        }
+
+        .tab.active .tab-badge {
+            background: #007bff;
+        }
     </style>
 </head>
+
 <body>
     <div class="container">
         <div class="header">
@@ -73,9 +275,10 @@
                 <h2>Create New Deployment Job</h2>
                 <form id="createJobForm">
                     <div class="form-group">
-                        <label for="gcsManifestPath">GCS Manifest Path</label>
-                        <input type="text" id="gcsManifestPath" placeholder="gs://bucket/path/model.manifest" required>
-                        <small style="color: #666; display: block; margin-top: 4px;">Shards are resolved relative to the manifest directory</small>
+                        <label for="gcsFilePath">GCS File Path</label>
+                        <input type="text" id="gcsFilePath" placeholder="gs://bucket/path/model.bin" required>
+                        <small style="color: #666; display: block; margin-top: 4px;">Path to the file in GCS (will be
+                            chunked on-the-fly)</small>
                     </div>
                     <button type="submit">Create Job</button>
                     <div id="createJobResult"></div>
@@ -90,7 +293,7 @@
                             <th>Job ID</th>
                             <th>GCS Path</th>
                             <th>Total Size</th>
-                            <th>Shards</th>
+                            <th>Chunks</th>
                             <th>Status</th>
                             <th>Created</th>
                             <th>Actions</th>
@@ -129,6 +332,7 @@
                         <tr>
                             <th>Server Address</th>
                             <th>Status</th>
+                            <th>Disk Usage</th>
                             <th>Last Heartbeat</th>
                         </tr>
                     </thead>
@@ -191,13 +395,23 @@
                 const servers = await res.json();
                 document.getElementById('serversCount').textContent = servers.length;
                 const tbody = document.querySelector('#serversTable tbody');
-                tbody.innerHTML = servers.map(s => `
+                tbody.innerHTML = servers.map(s => {
+                    let diskInfo = '-';
+                    if (s.diskTotalBytes && s.diskUsedBytes) {
+                        const totalGB = (s.diskTotalBytes / 1e9).toFixed(1);
+                        const usedGB = (s.diskUsedBytes / 1e9).toFixed(1);
+                        const pct = ((s.diskUsedBytes / s.diskTotalBytes) * 100).toFixed(0);
+                        diskInfo = `${usedGB} / ${totalGB} GB (${pct}%)`;
+                    }
+                    return `
                     <tr>
                         <td>${s.serverAddress}</td>
                         <td><span class="status ${s.status}">${s.status}</span></td>
+                        <td>${diskInfo}</td>
                         <td>${new Date(s.lastHeartbeat).toLocaleString()}</td>
                     </tr>
-                `).join('');
+                    `;
+                }).join('');
             } catch (e) {
                 console.error('Failed to fetch servers:', e);
             }
@@ -216,9 +430,9 @@
                     return `
                         <tr style="${isSelected ? 'background: #e3f2fd;' : ''}">
                             <td>${j.deploymentJobId.substring(0, 8)}...</td>
-                            <td>${j.gcsManifestPath}</td>
+                            <td>${j.gcsFilePath}</td>
                             <td>${formatBytes(j.totalSize)}</td>
-                            <td>${j.totalShards}</td>
+                            <td>${j.totalChunks}</td>
                             <td><span class="status ${j.status}">${j.status}</span></td>
                             <td>${new Date(j.createdAt).toLocaleString()}</td>
                             <td>
@@ -295,20 +509,20 @@
 
                 document.getElementById('jobDetailsCard').style.display = 'block';
 
-                const totalShards = details.job.totalShards;
+                const totalChunks = details.job.totalChunks;
                 const totalSize = details.job.totalSize;
-                const shardSize = details.job.shardSize;
+                const chunkSize = details.job.chunkSize;
                 const tbody = document.querySelector('#jobProgressTable tbody');
 
                 // Calculate overall progress
-                const totalShardsCompleted = details.serverProgress.reduce((sum, p) => sum + p.lastShardIdCompleted + 1, 0);
-                const totalExpectedShards = details.serverProgress.length * totalShards;
-                const overallProgress = totalExpectedShards > 0 ? (totalShardsCompleted / totalExpectedShards * 100).toFixed(1) : 0;
+                const totalChunksCompleted = details.serverProgress.reduce((sum, p) => sum + p.lastChunkIdCompleted + 1, 0);
+                const totalExpectedChunks = details.serverProgress.length * totalChunks;
+                const overallProgress = totalExpectedChunks > 0 ? (totalChunksCompleted / totalExpectedChunks * 100).toFixed(1) : 0;
 
                 // Calculate total bytes transferred
                 const totalBytesTransferred = details.serverProgress.reduce((sum, p) => {
-                    const shardsComplete = p.lastShardIdCompleted + 1;
-                    return sum + (shardsComplete * shardSize);
+                    const chunksComplete = p.lastChunkIdCompleted + 1;
+                    return sum + (chunksComplete * chunkSize);
                 }, 0);
                 const totalExpectedBytes = details.serverProgress.length * totalSize;
 
@@ -319,8 +533,8 @@
                 const serverCount = details.serverProgress.length;
                 const avgBytesComplete = serverCount > 0
                     ? details.serverProgress.reduce((sum, p) => {
-                        const shardsComplete = p.lastShardIdCompleted + 1;
-                        return sum + Math.min(shardsComplete * shardSize, totalSize);
+                        const chunksComplete = p.lastChunkIdCompleted + 1;
+                        return sum + Math.min(chunksComplete * chunkSize, totalSize);
                     }, 0) / serverCount
                     : 0;
                 const avgProgress = totalSize > 0 ? (avgBytesComplete / totalSize * 100).toFixed(1) : 0;
@@ -328,8 +542,8 @@
                 document.getElementById('jobSummary').innerHTML = `
                     <span><strong>Elapsed:</strong> ${formatElapsed(details.job.createdAt, details.job.updatedAt, details.job.status)}</span>
                     <span><strong>Total Size:</strong> ${formatBytes(totalSize)}</span>
-                    <span><strong>Shard Size:</strong> ${formatBytes(shardSize)}</span>
-                    <span><strong>Shards:</strong> ${totalShards}</span>
+                    <span><strong>Chunk Size:</strong> ${formatBytes(chunkSize)}</span>
+                    <span><strong>Chunks:</strong> ${totalChunks}</span>
                     <span><strong>Avg Progress:</strong> ${formatBytes(avgBytesComplete)} / ${formatBytes(totalSize)} (${avgProgress}%)</span>
                 `;
 
@@ -346,24 +560,13 @@
                 });
 
                 tbody.innerHTML = details.serverProgress.map(p => {
-                    const shardsComplete = p.lastShardIdCompleted + 1;
-                    // Calculate overall progress including current shard progress
-                    let effectiveProgress = shardsComplete;
-                    if (p.currentShardId != null && p.currentShardProgressPct != null) {
-                        effectiveProgress = shardsComplete + (p.currentShardProgressPct / 100);
-                    }
-                    const progress = totalShards > 0 ? (effectiveProgress / totalShards * 100).toFixed(1) : 0;
-                    const bytesComplete = Math.min(effectiveProgress * shardSize, totalSize);
+                    const chunksComplete = p.lastChunkIdCompleted + 1;
+                    const progress = totalChunks > 0 ? (chunksComplete / totalChunks * 100).toFixed(1) : 0;
+                    const bytesComplete = Math.min(chunksComplete * chunkSize, totalSize);
 
                     // Use calculated throughputs (check for null, not falsy, since 0 is valid)
                     const downloadThroughput = p.downloadThroughputBps != null ? formatThroughput(p.downloadThroughputBps) : '-';
                     const uploadThroughput = p.uploadThroughputBps != null ? formatThroughput(p.uploadThroughputBps) : '-';
-
-                    // Show current shard being worked on
-                    let currentShardInfo = '';
-                    if (p.currentShardId != null && p.currentShardProgressPct != null) {
-                        currentShardInfo = ` (shard ${p.currentShardId}: ${p.currentShardProgressPct.toFixed(0)}%)`;
-                    }
 
                     return `
                         <tr>
@@ -376,7 +579,7 @@
                                     <div class="progress-fill" style="width: ${progress}%"></div>
                                 </div>
                                 ${formatBytes(bytesComplete)} / ${formatBytes(totalSize)} (${progress}%)<br>
-                                <span style="color: #6c757d; font-size: 12px;">${shardsComplete} / ${totalShards} shards${currentShardInfo}</span>
+                                <span style="color: #6c757d; font-size: 12px;">${chunksComplete} / ${totalChunks} chunks</span>
                             </td>
                             <td class="throughput">${downloadThroughput}</td>
                             <td class="throughput">${uploadThroughput}</td>
@@ -397,7 +600,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        gcsManifestPath: document.getElementById('gcsManifestPath').value
+                        gcsFilePath: document.getElementById('gcsFilePath').value
                     })
                 });
 
@@ -444,4 +647,5 @@
         setInterval(refreshAll, 2000);
     </script>
 </body>
+
 </html>

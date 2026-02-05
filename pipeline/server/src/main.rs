@@ -6,6 +6,7 @@ mod storage;
 
 use chrono::Utc;
 use common::TaskProgress;
+use nix::sys::statvfs::statvfs;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,11 +15,30 @@ use tokio::sync::RwLock;
 use tonic::transport::Server;
 use uuid::Uuid;
 
+/// Get disk stats for the root filesystem (total bytes, used bytes)
+fn get_disk_stats(_data_dir: &std::path::Path) -> Option<(u64, u64)> {
+    // Get disk stats from root filesystem to represent whole VM disk
+    match statvfs("/") {
+        Ok(stat) => {
+            let block_size = stat.block_size() as u64;
+            let total_blocks = stat.blocks() as u64;
+            let free_blocks = stat.blocks_available() as u64;
+            let total = total_blocks * block_size;
+            let used = (total_blocks - free_blocks) * block_size;
+            Some((total, used))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to get disk stats: {}", e);
+            None
+        }
+    }
+}
+
 use common::UpstreamType;
 use coordinator_client::CoordinatorClient;
 use downloader::Downloader;
-use file_service::{FileService, UploadTracker};
-use storage::ShardStorage;
+use file_service::{ChunkMeta, ChunkMetaStore, FileService, UploadTracker};
+use storage::ChunkStorage;
 
 /// Rolling window throughput tracker
 /// Tracks cumulative bytes over time and calculates throughput from the window
@@ -95,19 +115,11 @@ impl ThroughputTracker {
 }
 
 struct TaskState {
-    /// Last fully completed shard
-    last_shard_completed: i32,
+    /// Last fully completed chunk
+    last_chunk_completed: i32,
     completed: bool,
-    /// Cumulative bytes from completed shards
-    bytes_downloaded_completed: u64,
-    /// Bytes downloaded in current shard (transient, reset per shard)
-    bytes_downloaded_current: u64,
-    /// Monotonically increasing total bytes (for throughput calculation, never resets)
-    total_bytes_downloaded: u64,
-    /// Current shard being downloaded
-    current_shard_id: Option<i32>,
-    /// Progress within current shard (0-100%)
-    current_shard_progress_pct: Option<f32>,
+    /// Total bytes downloaded so far
+    bytes_downloaded: u64,
     /// Rolling window download throughput tracker
     download_throughput: ThroughputTracker,
 }
@@ -155,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Data directory: {}", data_dir);
 
     // Create storage
-    let storage = Arc::new(ShardStorage::new(PathBuf::from(&data_dir)));
+    let storage = Arc::new(ChunkStorage::new(PathBuf::from(&data_dir)));
 
     // Create coordinator client
     let coordinator = CoordinatorClient::new(coordinator_url, server_addr.clone());
@@ -172,8 +184,11 @@ async fn main() -> anyhow::Result<()> {
     // Track uploaded bytes per job
     let upload_tracker: UploadTracker = Arc::new(RwLock::new(HashMap::new()));
 
+    // Track chunk metadata for P2P serving
+    let chunk_meta: ChunkMetaStore = Arc::new(RwLock::new(HashMap::new()));
+
     // Spawn gRPC server
-    let file_service = FileService::new(storage.clone(), upload_tracker.clone());
+    let file_service = FileService::new(storage.clone(), upload_tracker.clone(), chunk_meta.clone());
     let grpc_addr = format!("0.0.0.0:{}", grpc_port).parse()?;
     tokio::spawn(async move {
         tracing::info!("Starting gRPC server on {}", grpc_addr);
@@ -191,6 +206,8 @@ async fn main() -> anyhow::Result<()> {
     let heartbeat_storage = storage.clone();
     let heartbeat_upload_tracker = upload_tracker.clone();
     let heartbeat_cancelled = cancelled_jobs.clone();
+    let heartbeat_chunk_meta = chunk_meta.clone();
+    let heartbeat_data_dir = PathBuf::from(&data_dir);
     let heartbeat_coordinator = CoordinatorClient::new(
         std::env::var("COORDINATOR_URL").unwrap_or_else(|_| "http://localhost:8080".to_string()),
         server_addr.clone(),
@@ -206,30 +223,30 @@ async fn main() -> anyhow::Result<()> {
             let progress: Vec<TaskProgress> = states
                 .iter_mut()
                 .map(|(job_id, state)| {
-                    // Use monotonic counter for throughput (never resets between shards)
-                    state.download_throughput.record(state.total_bytes_downloaded);
+                    // Use bytes_downloaded for throughput calculation
+                    state.download_throughput.record(state.bytes_downloaded);
                     let download_throughput_bps = state.download_throughput.get_throughput();
-
-                    // Use completed + current for reporting total bytes
-                    let bytes_downloaded = state.bytes_downloaded_completed + state.bytes_downloaded_current;
 
                     TaskProgress {
                         deployment_job_id: *job_id,
-                        last_shard_id_completed: state.last_shard_completed,
+                        last_chunk_id_completed: state.last_chunk_completed,
                         completed_at: if state.completed { Some(Utc::now()) } else { None },
-                        bytes_downloaded,
+                        bytes_downloaded: state.bytes_downloaded,
                         bytes_uploaded: *uploads.get(job_id).unwrap_or(&0),
                         download_throughput_bps,
                         upload_throughput_bps: None, // TODO: track upload throughput similarly
-                        current_shard_id: state.current_shard_id,
-                        current_shard_progress_pct: state.current_shard_progress_pct,
                     }
                 })
                 .collect();
             drop(states);
             drop(uploads);
 
-            match heartbeat_coordinator.heartbeat(progress).await {
+            // Get disk stats
+            let (disk_total, disk_used) = get_disk_stats(&heartbeat_data_dir)
+                .map(|(t, u)| (Some(t), Some(u)))
+                .unwrap_or((None, None));
+
+            match heartbeat_coordinator.heartbeat(progress, disk_total, disk_used).await {
                 Ok(response) => {
                     // Handle cancel requests - add to cancelled set so download loop can check
                     if !response.cancel_job_ids.is_empty() {
@@ -252,6 +269,11 @@ async fn main() -> anyhow::Result<()> {
                         {
                             let mut cancelled = heartbeat_cancelled.write().await;
                             cancelled.remove(&job_id);
+                        }
+                        // Remove from chunk meta
+                        {
+                            let mut meta = heartbeat_chunk_meta.write().await;
+                            meta.remove(&job_id);
                         }
                         // Delete data from storage
                         if let Err(e) = heartbeat_storage.delete_job(job_id).await {
@@ -285,7 +307,8 @@ async fn main() -> anyhow::Result<()> {
             continue;
         }
 
-        tracing::info!("Got {} tasks", tasks.len());
+        let job_ids: Vec<_> = tasks.iter().map(|t| t.deployment_job_id).collect::<Vec<_>>();
+        tracing::info!("Received {} tasks for jobs: {:?}", tasks.len(), job_ids);
 
         // Process each task
         for task in tasks {
@@ -300,6 +323,16 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Store chunk metadata for P2P serving
+            {
+                let mut meta = chunk_meta.write().await;
+                meta.insert(job_id, ChunkMeta {
+                    chunk_size: task.chunk_size,
+                    total_size: task.total_size,
+                    total_chunks: task.total_chunks,
+                });
+            }
+
             // Get upstream assignment for this specific job
             let upstream = match coordinator.get_upstream(Some(job_id)).await {
                 Ok(upstream) => upstream,
@@ -310,19 +343,19 @@ async fn main() -> anyhow::Result<()> {
             };
 
             // Get current progress - check local storage first, then in-memory state
-            let start_from_shard = {
+            let start_from_chunk = {
                 let states = task_states.read().await;
                 match states.get(&job_id) {
-                    Some(s) => s.last_shard_completed + 1,
+                    Some(s) => s.last_chunk_completed + 1,
                     None => {
-                        // On restart, check local storage for completed shards
-                        storage.get_last_completed_shard(job_id).await + 1
+                        // On restart, check local storage for completed chunks
+                        storage.get_last_completed_chunk(job_id, task.chunk_size).await + 1
                     }
                 }
             };
 
             // Skip if already completed
-            if start_from_shard >= task.total_shards {
+            if start_from_chunk >= task.total_chunks {
                 let mut states = task_states.write().await;
                 if let Some(state) = states.get_mut(&job_id) {
                     state.completed = true;
@@ -334,173 +367,124 @@ async fn main() -> anyhow::Result<()> {
             {
                 let mut states = task_states.write().await;
                 states.entry(job_id).or_insert(TaskState {
-                    last_shard_completed: start_from_shard - 1,
+                    last_chunk_completed: start_from_chunk - 1,
                     completed: false,
-                    bytes_downloaded_completed: 0,
-                    bytes_downloaded_current: 0,
-                    total_bytes_downloaded: 0,
-                    current_shard_id: None,
-                    current_shard_progress_pct: None,
+                    bytes_downloaded: 0,
                     download_throughput: ThroughputTracker::new(5.0), // 5 second rolling window
                 });
             }
 
-            // Connect to peer once if using P2P upstream
-            let mut peer_client = if upstream.upstream_type == UpstreamType::Peer {
-                match upstream.upstream_peer_address.as_deref() {
-                    Some(addr) => match Downloader::connect_to_peer(addr).await {
-                        Ok(client) => Some(client),
-                        Err(e) => {
-                            tracing::warn!("Failed to connect to peer {}: {} - will retry", addr, e);
-                            continue; // Skip this task, retry on next poll
-                        }
-                    },
-                    None => {
-                        tracing::warn!("No peer address for P2P upstream - will retry");
-                        continue;
-                    }
-                }
-            } else {
-                None
-            };
+            // Initialize output file if not already done
+            if let Err(e) = storage.initialize(job_id, task.chunk_size).await {
+                tracing::error!("Failed to initialize file for job {}: {}", job_id, e);
+                continue;
+            }
 
-            // Fetch manifest to get shard paths
-            let manifest = match downloader.fetch_manifest(&task.gcs_manifest_path).await {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("Failed to fetch manifest for job {}: {} - will retry", job_id, e);
-                    continue;
-                }
-            };
-
-            // Derive base path from manifest path (parent directory)
-            let gcs_base_path = task
-                .gcs_manifest_path
-                .rsplit_once('/')
-                .map(|(parent, _)| parent)
-                .unwrap_or(&task.gcs_manifest_path);
-
-            // Download shards
-            for shard_id in start_from_shard..task.total_shards {
-                // Check if job was cancelled
-                {
-                    let cancelled = cancelled_jobs.read().await;
-                    if cancelled.contains(&job_id) {
-                        tracing::info!("Job {} cancelled, aborting download at shard {}", job_id, shard_id);
-                        break;
-                    }
-                }
-
-                // Update current shard being worked on
-                {
-                    let mut states = task_states.write().await;
+            // Progress callback - update bytes downloaded and chunk progress
+            let task_states_clone = task_states.clone();
+            let progress_callback = move |chunk_id: i32, _total_chunks: i32, bytes_downloaded: u64, _throughput_bps: Option<u64>| {
+                let states = task_states_clone.clone();
+                async move {
+                    let mut states = states.write().await;
                     if let Some(state) = states.get_mut(&job_id) {
-                        state.current_shard_id = Some(shard_id);
-                        state.current_shard_progress_pct = Some(0.0);
+                        state.bytes_downloaded = bytes_downloaded;
+                        state.last_chunk_completed = chunk_id;
                     }
                 }
+            };
 
-                // Progress callback for bytes within this shard
-                let task_states_clone = task_states.clone();
-                let progress_callback = move |bytes_in_shard: u64, total_bytes: u64, _throughput_bps: Option<u64>| {
-                    let states = task_states_clone.clone();
-                    async move {
-                        let mut states = states.write().await;
-                        if let Some(state) = states.get_mut(&job_id) {
-                            // Store current shard's cumulative progress (not a delta)
-                            state.bytes_downloaded_current = bytes_in_shard;
-                            // Update monotonic counter (for throughput calculation)
-                            state.total_bytes_downloaded = state.bytes_downloaded_completed + bytes_in_shard;
-                            // Calculate progress within shard as percentage
-                            let progress_pct = if total_bytes > 0 {
-                                (bytes_in_shard as f32 / total_bytes as f32) * 100.0
-                            } else {
-                                0.0
-                            };
-                            state.current_shard_progress_pct = Some(progress_pct);
-                        }
-                    }
-                };
-
-                // Get shard info from manifest
-                let shard_info = manifest.shards.get(shard_id as usize);
-                let shard_path = shard_info
-                    .map(|s| s.path.as_str())
-                    .unwrap_or_else(|| {
-                        tracing::warn!("Shard {} not found in manifest, using default path", shard_id);
-                        ""
-                    });
-                let shard_size = shard_info.map(|s| s.size).unwrap_or(task.shard_size);
-
-                // Download the shard
-                let result = match upstream.upstream_type {
-                    UpstreamType::Gcs => {
-                        // Use parallel range requests for production GCS (much faster)
-                        // Fall back to single-stream for emulator (may not support ranges well)
-                        if std::env::var("STORAGE_EMULATOR_HOST").is_ok() {
-                            downloader
-                                .download_shard_from_gcs(
-                                    job_id,
-                                    gcs_base_path,
-                                    shard_path,
-                                    shard_id,
-                                    shard_size,
-                                    progress_callback,
-                                )
-                                .await
-                        } else {
-                            downloader
-                                .download_shard_from_gcs_parallel(
-                                    job_id,
-                                    gcs_base_path,
-                                    shard_path,
-                                    shard_id,
-                                    shard_size,
-                                    progress_callback,
-                                )
-                                .await
-                        }
-                    }
-                    UpstreamType::Peer => {
-                        downloader
-                            .download_shard_from_peer(
-                                peer_client.as_mut().unwrap(),
-                                job_id,
-                                shard_id,
-                                shard_size,
-                                progress_callback,
-                            )
-                            .await
-                    }
-                };
-
-                match result {
-                    Ok(verified) => {
-                        if verified {
-                            // Shard completed and verified
-                            let mut states = task_states.write().await;
-                            if let Some(state) = states.get_mut(&job_id) {
-                                // Move current shard bytes to completed total
-                                state.bytes_downloaded_completed += shard_size;
-                                state.bytes_downloaded_current = 0;
-                                state.last_shard_completed = shard_id;
-                                if shard_id >= task.total_shards - 1 {
-                                    state.completed = true;
-                                    state.current_shard_id = None;
-                                    state.current_shard_progress_pct = None;
-                                    tracing::info!("Completed task for job {}", job_id);
+            // Download chunks
+            let result = match upstream.upstream_type {
+                UpstreamType::Gcs => {
+                    downloader
+                        .download_chunks_from_gcs(
+                            job_id,
+                            &task.gcs_file_path,
+                            start_from_chunk,
+                            task.total_chunks,
+                            task.chunk_size,
+                            task.total_size,
+                            progress_callback,
+                        )
+                        .await
+                }
+                UpstreamType::Peer => {
+                    match upstream.upstream_peer_address.as_deref() {
+                        Some(addr) => {
+                            match Downloader::connect_to_peer(addr).await {
+                                Ok(mut client) => {
+                                    downloader
+                                        .download_chunks_from_peer(
+                                            &mut client,
+                                            job_id,
+                                            start_from_chunk,
+                                            task.total_chunks,
+                                            task.chunk_size,
+                                            task.total_size,
+                                            progress_callback,
+                                        )
+                                        .await
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Failed to connect to peer {}: {} - will retry", addr, e);
+                                    continue;
                                 }
                             }
-                        } else {
-                            // Verification failed - need to re-download shard
-                            tracing::warn!("Shard {} verification failed for job {}, will retry", shard_id, job_id);
-                            break; // Exit shard loop, will retry on next poll
+                        }
+                        None => {
+                            tracing::warn!("No peer address for P2P upstream - will retry");
+                            continue;
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to download shard {} for job {}: {}", shard_id, job_id, e);
-                        break; // Exit shard loop, will retry on next poll
+                }
+            };
+
+            match result {
+                Ok(true) => {
+                    // Download completed successfully
+                    let mut states = task_states.write().await;
+                    if let Some(state) = states.get_mut(&job_id) {
+                        state.last_chunk_completed = task.total_chunks - 1;
                     }
+                    drop(states);
+
+                    // Finalize and verify
+                    if let Err(e) = storage.finalize(job_id).await {
+                        tracing::error!("Failed to finalize job {}: {}", job_id, e);
+                        continue;
+                    }
+
+                    // Verify CRC32C
+                    match storage.verify_crc32c(job_id, &task.file_crc32c).await {
+                        Ok(true) => {
+                            let mut states = task_states.write().await;
+                            if let Some(state) = states.get_mut(&job_id) {
+                                state.completed = true;
+                            }
+                            tracing::info!("Completed and verified job {}", job_id);
+                        }
+                        Ok(false) => {
+                            tracing::error!("CRC32C verification failed for job {} - will need re-download", job_id);
+                            // Don't mark as completed, will retry on next poll
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to verify CRC32C for job {}: {}", job_id, e);
+                        }
+                    }
+                }
+                Ok(false) => {
+                    // Download failed verification - will retry on next poll
+                    tracing::warn!("Download verification failed for job {} - will retry", job_id);
+
+                    // Update state with what we completed
+                    let last_completed = storage.get_last_completed_chunk(job_id, task.chunk_size).await;
+                    let mut states = task_states.write().await;
+                    if let Some(state) = states.get_mut(&job_id) {
+                        state.last_chunk_completed = last_completed;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Download error for job {}: {} - will retry", job_id, e);
                 }
             }
         }

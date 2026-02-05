@@ -1,5 +1,5 @@
 use common::proto::file_transfer_server::{FileTransfer, FileTransferServer};
-use common::proto::{PieceData, ShardRequest};
+use common::proto::{ChunkData, ChunkRequest};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -8,25 +8,36 @@ use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
 use crate::constants::GRPC_MAX_MESSAGE_SIZE;
-use crate::storage::{compute_crc32c, ShardStorage};
-
-/// Chunk size for streaming (1MB) - balances overhead vs reliability
-const STREAM_CHUNK_SIZE: usize = 1 * 1024 * 1024;
+use crate::storage::{compute_crc32c, ChunkStorage};
 
 /// How long to wait for new data before checking again
 const POLL_INTERVAL_MS: u64 = 50;
 
+/// Maximum wait time for a chunk to become available (30 seconds)
+const MAX_WAIT_MS: u64 = 30_000;
+
 /// Tracks cumulative bytes uploaded per job
 pub type UploadTracker = Arc<RwLock<HashMap<Uuid, u64>>>;
 
+/// Chunk metadata needed for streaming
+pub struct ChunkMeta {
+    pub chunk_size: u64,
+    pub total_size: u64,
+    pub total_chunks: i32,
+}
+
+/// Chunk metadata store (set by main when task is received)
+pub type ChunkMetaStore = Arc<RwLock<HashMap<Uuid, ChunkMeta>>>;
+
 pub struct FileService {
-    storage: Arc<ShardStorage>,
+    storage: Arc<ChunkStorage>,
     upload_tracker: UploadTracker,
+    chunk_meta: ChunkMetaStore,
 }
 
 impl FileService {
-    pub fn new(storage: Arc<ShardStorage>, upload_tracker: UploadTracker) -> Self {
-        Self { storage, upload_tracker }
+    pub fn new(storage: Arc<ChunkStorage>, upload_tracker: UploadTracker, chunk_meta: ChunkMetaStore) -> Self {
+        Self { storage, upload_tracker, chunk_meta }
     }
 
     pub fn into_server(self) -> FileTransferServer<Self> {
@@ -38,172 +49,118 @@ impl FileService {
 
 #[tonic::async_trait]
 impl FileTransfer for FileService {
-    type StreamShardsStream = ReceiverStream<Result<PieceData, Status>>;
+    type StreamChunksStream = ReceiverStream<Result<ChunkData, Status>>;
 
-    async fn stream_shards(
+    async fn stream_chunks(
         &self,
-        request: Request<ShardRequest>,
-    ) -> Result<Response<Self::StreamShardsStream>, Status> {
+        request: Request<ChunkRequest>,
+    ) -> Result<Response<Self::StreamChunksStream>, Status> {
         let req = request.into_inner();
 
         let job_id = Uuid::parse_str(&req.job_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid job ID: {}", e)))?;
 
-        let shard_id = req.from_shard;
+        let start_chunk = req.start_from_chunk_id;
         let storage = self.storage.clone();
         let upload_tracker = self.upload_tracker.clone();
+        let chunk_meta = self.chunk_meta.clone();
 
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(4); // Small buffer since chunks are large
 
-        tracing::info!("Starting stream for shard {} of job {}", shard_id, job_id);
+        tracing::info!("Starting chunk stream for job {} from chunk {}", job_id, start_chunk);
 
         tokio::spawn(async move {
-            let mut retries = 0;
-            const MAX_RETRIES: u32 = 600; // Wait up to 30 seconds (600 * 50ms)
-
-            // Wait for shard to start (either complete or partial)
-            while !storage.shard_exists(job_id, shard_id).await
-                && !storage.partial_exists(job_id, shard_id).await
-            {
-                retries += 1;
-                if retries >= MAX_RETRIES {
-                    tracing::warn!(
-                        "Shard {} for job {} not available after {} retries, ending stream",
-                        shard_id, job_id, retries
-                    );
-                    return;
+            // Get chunk metadata
+            let meta = {
+                let metas = chunk_meta.read().await;
+                match metas.get(&job_id) {
+                    Some(m) => ChunkMeta {
+                        chunk_size: m.chunk_size,
+                        total_size: m.total_size,
+                        total_chunks: m.total_chunks,
+                    },
+                    None => {
+                        tracing::warn!("No chunk metadata for job {}", job_id);
+                        let _ = tx.send(Err(Status::not_found("Job metadata not found"))).await;
+                        return;
+                    }
                 }
-                tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
-            }
+            };
 
-            // Stream pieces as they become available
-            let mut bytes_sent: u64 = 0;
-            let mut piece_index: i32 = 0;
-            let mut stall_count = 0;
-            const MAX_STALL: u32 = 600; // 30 seconds of no new data
+            let chunk_size = meta.chunk_size;
+            let total_size = meta.total_size;
+            let total_chunks = meta.total_chunks;
 
-            loop {
-                // Check if shard is complete (mutable - may be updated below)
-                let mut is_complete = storage.shard_exists(job_id, shard_id).await;
-
-                // Get current available size (using metadata, not reading file content)
-                // Handle race: partial may have been renamed to complete since last check
-                let available_size = if is_complete {
-                    match storage.get_shard_size(job_id, shard_id).await {
-                        Ok(size) => size,
-                        Err(e) => {
-                            tracing::error!("Failed to get shard size {}: {}", shard_id, e);
-                            let _ = tx.send(Err(Status::internal(format!("Failed to get shard size: {}", e)))).await;
-                            return;
-                        }
-                    }
-                } else {
-                    // Try to get partial size, but if it fails, the shard might have just been finalized
-                    match storage.get_partial_size(job_id, shard_id).await {
-                        Ok(size) => size,
-                        Err(_) => {
-                            // Partial file gone - check if shard is now complete
-                            if storage.shard_exists(job_id, shard_id).await {
-                                // Shard was just finalized - update flag and get complete size
-                                is_complete = true;
-                                match storage.get_shard_size(job_id, shard_id).await {
-                                    Ok(size) => size,
-                                    Err(e) => {
-                                        tracing::error!("Failed to get finalized shard size {}: {}", shard_id, e);
-                                        let _ = tx.send(Err(Status::internal(format!("Shard finalized but can't read size: {}", e)))).await;
-                                        return;
-                                    }
-                                }
-                            } else {
-                                // Neither partial nor complete exists - wait for it
-                                0
-                            }
-                        }
-                    }
-                };
-
-                // Send any new complete pieces
-                while bytes_sent + STREAM_CHUNK_SIZE as u64 <= available_size
-                    || (is_complete && bytes_sent < available_size)
-                {
-                    let chunk_size = if is_complete && available_size - bytes_sent < STREAM_CHUNK_SIZE as u64 {
-                        // Last chunk of complete shard
-                        (available_size - bytes_sent) as usize
-                    } else {
-                        STREAM_CHUNK_SIZE
-                    };
-
-                    let chunk = match storage.read_shard_range(job_id, shard_id, bytes_sent, chunk_size).await {
-                        Ok(data) => data,
-                        Err(e) => {
-                            tracing::error!("Failed to read shard range at {}: {}", bytes_sent, e);
-                            let _ = tx.send(Err(Status::internal(format!("Failed to read shard: {}", e)))).await;
-                            return;
-                        }
-                    };
-
-                    if chunk.is_empty() {
-                        break;
-                    }
-
-                    let crc32c = compute_crc32c(&chunk);
-
-                    // Calculate total pieces (unknown until complete, use -1 as placeholder)
-                    let total_pieces = if is_complete {
-                        ((available_size as usize + STREAM_CHUNK_SIZE - 1) / STREAM_CHUNK_SIZE) as i32
-                    } else {
-                        -1 // Unknown until shard is complete
-                    };
-
-                    let piece_data = PieceData {
-                        shard_id,
-                        piece_index,
-                        total_pieces,
-                        data: chunk,
-                        crc32c,
-                    };
-
-                    if tx.send(Ok(piece_data)).await.is_err() {
-                        // Receiver dropped - client disconnected
-                        tracing::info!(
-                            "Stream for shard {} ended early: client disconnected at {} bytes ({} pieces sent)",
-                            shard_id, bytes_sent, piece_index
+            // Stream chunks starting from requested position
+            for chunk_id in start_chunk..total_chunks {
+                // Wait for chunk to be available
+                let mut waited_ms: u64 = 0;
+                while !storage.is_chunk_complete(job_id, chunk_id, chunk_size, total_size).await {
+                    if waited_ms >= MAX_WAIT_MS {
+                        tracing::warn!(
+                            "Chunk {} for job {} not available after {}ms, ending stream",
+                            chunk_id, job_id, waited_ms
                         );
                         return;
                     }
+                    tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+                    waited_ms += POLL_INTERVAL_MS;
+                }
 
-                    // Track uploaded bytes
-                    {
-                        let mut tracker = upload_tracker.write().await;
-                        *tracker.entry(job_id).or_insert(0) += chunk_size as u64;
+                // Calculate chunk bounds
+                let offset = chunk_id as u64 * chunk_size;
+                let this_chunk_size = if chunk_id == total_chunks - 1 {
+                    // Last chunk may be smaller
+                    let remainder = total_size % chunk_size;
+                    if remainder == 0 { chunk_size } else { remainder }
+                } else {
+                    chunk_size
+                };
+
+                // Read the chunk
+                let data = match storage.read_range(job_id, offset, this_chunk_size as usize).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::error!("Failed to read chunk {} for job {}: {}", chunk_id, job_id, e);
+                        let _ = tx.send(Err(Status::internal(format!("Failed to read chunk: {}", e)))).await;
+                        return;
                     }
+                };
 
-                    bytes_sent += chunk_size as u64;
-                    piece_index += 1;
-                    stall_count = 0; // Reset stall counter on progress
-                }
+                // Compute CRC32C
+                let crc32c = compute_crc32c(&data);
 
-                // If complete and all sent, we're done
-                if is_complete && bytes_sent >= available_size {
+                // Send chunk
+                let chunk_data = ChunkData {
+                    chunk_id,
+                    data,
+                    crc32c,
+                };
+
+                let chunk_len = chunk_data.data.len() as u64;
+
+                if tx.send(Ok(chunk_data)).await.is_err() {
+                    // Receiver dropped - client disconnected
                     tracing::info!(
-                        "Finished streaming shard {} ({} bytes, {} pieces)",
-                        shard_id, bytes_sent, piece_index
+                        "Stream for job {} ended early: client disconnected at chunk {}",
+                        job_id, chunk_id
                     );
                     return;
                 }
 
-                // Wait for more data
-                stall_count += 1;
-                if stall_count >= MAX_STALL {
-                    tracing::warn!(
-                        "Shard {} stalled at {} bytes after {} polls, ending stream",
-                        shard_id, bytes_sent, stall_count
-                    );
-                    return;
+                // Track uploaded bytes
+                {
+                    let mut tracker = upload_tracker.write().await;
+                    *tracker.entry(job_id).or_insert(0) += chunk_len;
                 }
 
-                tokio::time::sleep(tokio::time::Duration::from_millis(POLL_INTERVAL_MS)).await;
+                tracing::debug!("Streamed chunk {} ({} bytes) for job {}", chunk_id, chunk_len, job_id);
             }
+
+            tracing::info!(
+                "Finished streaming job {} ({} chunks)",
+                job_id, total_chunks - start_chunk
+            );
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))

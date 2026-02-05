@@ -57,13 +57,20 @@ impl CoordinatorClient {
         Ok(assignment)
     }
 
-    /// Send heartbeat with task progress, returns jobs to purge
-    pub async fn heartbeat(&self, task_progress: Vec<TaskProgress>) -> anyhow::Result<HeartbeatResponse> {
+    /// Send heartbeat with task progress and disk stats, returns jobs to purge
+    pub async fn heartbeat(
+        &self,
+        task_progress: Vec<TaskProgress>,
+        disk_total_bytes: Option<u64>,
+        disk_used_bytes: Option<u64>,
+    ) -> anyhow::Result<HeartbeatResponse> {
         let url = format!("{}/server/heartbeat", self.base_url);
 
         let request = HeartbeatRequest {
             server_address: self.server_address.clone(),
             task_progress,
+            disk_total_bytes,
+            disk_used_bytes,
         };
 
         let response = self.client.post(&url).json(&request).send().await?;

@@ -127,6 +127,12 @@ pub struct Server {
     pub server_address: String,
     pub last_heartbeat: DateTime<Utc>,
     pub status: ServerStatus,
+    /// Total disk space in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_total_bytes: Option<u64>,
+    /// Used disk space in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_used_bytes: Option<u64>,
 }
 
 /// Deployment job
@@ -136,10 +142,11 @@ pub struct DeploymentJob {
     pub deployment_job_id: Uuid,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
-    pub gcs_manifest_path: String,
-    pub total_shards: i32,
+    pub gcs_file_path: String,
+    pub total_chunks: i32,
     pub total_size: u64,
-    pub shard_size: u64,
+    pub chunk_size: u64,
+    pub file_crc32c: String,
     pub status: JobStatus,
 }
 
@@ -148,9 +155,11 @@ pub struct DeploymentJob {
 #[serde(rename_all = "camelCase")]
 pub struct DeploymentTask {
     pub deployment_job_id: Uuid,
-    pub gcs_manifest_path: String,
-    pub total_shards: i32,
-    pub shard_size: u64,
+    pub gcs_file_path: String,
+    pub total_chunks: i32,
+    pub total_size: u64,
+    pub chunk_size: u64,
+    pub file_crc32c: String,
 }
 
 /// Upstream assignment response
@@ -167,8 +176,8 @@ pub struct UpstreamAssignment {
 #[serde(rename_all = "camelCase")]
 pub struct TaskProgress {
     pub deployment_job_id: Uuid,
-    /// Last fully completed shard (persisted to DB)
-    pub last_shard_id_completed: i32,
+    /// Last fully completed chunk (persisted to DB)
+    pub last_chunk_id_completed: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
     /// Cumulative bytes downloaded for this task
@@ -181,12 +190,6 @@ pub struct TaskProgress {
     /// Upload throughput in bytes per second (calculated by server over rolling window)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_throughput_bps: Option<u64>,
-    /// Current shard being downloaded (for UI display, not persisted)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_shard_id: Option<i32>,
-    /// Progress within current shard as percentage 0-100 (for UI display, not persisted)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_shard_progress_pct: Option<f32>,
 }
 
 /// Heartbeat request from server
@@ -195,6 +198,12 @@ pub struct TaskProgress {
 pub struct HeartbeatRequest {
     pub server_address: String,
     pub task_progress: Vec<TaskProgress>,
+    /// Total disk space in bytes (data directory filesystem)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_total_bytes: Option<u64>,
+    /// Used disk space in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_used_bytes: Option<u64>,
 }
 
 /// Heartbeat response to server
@@ -212,27 +221,11 @@ pub struct HeartbeatResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateJobRequest {
-    /// Path to the manifest file (e.g., gs://bucket/path/model.manifest)
-    pub gcs_manifest_path: String,
-}
-
-/// Shard info in manifest
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ShardInfo {
-    pub shard_id: i32,
-    /// Relative path to shard file (relative to manifest location)
-    pub path: String,
-    pub size: u64,
-    pub sha256: String,
-}
-
-/// GCS manifest format
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GcsManifest {
-    pub total_size: u64,
-    pub shard_size: u64,
-    pub num_shards: i32,
-    pub shards: Vec<ShardInfo>,
+    /// Path to the file in GCS (e.g., gs://bucket/path/model.bin)
+    pub gcs_file_path: String,
+    /// Optional chunk size override (default 16MB)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<u64>,
 }
 
 /// Create job response
@@ -255,8 +248,8 @@ pub struct JobDetails {
 #[serde(rename_all = "camelCase")]
 pub struct ServerTaskProgress {
     pub server_address: String,
-    /// Last fully completed shard
-    pub last_shard_id_completed: i32,
+    /// Last fully completed chunk
+    pub last_chunk_id_completed: i32,
     pub status: TaskStatus,
     /// Server health status
     pub server_status: ServerStatus,
@@ -268,10 +261,4 @@ pub struct ServerTaskProgress {
     /// Upload throughput in bytes per second (calculated by coordinator)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_throughput_bps: Option<u64>,
-    /// Current shard being downloaded (for UI display)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_shard_id: Option<i32>,
-    /// Progress within current shard as percentage (for UI display)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub current_shard_progress_pct: Option<f32>,
 }
