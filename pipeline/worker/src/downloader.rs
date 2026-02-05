@@ -1,4 +1,3 @@
-use bytes::Bytes;
 use common::proto::p2p_transfer_client::P2pTransferClient;
 use common::proto::ChunkRequest;
 use object_store::gcp::GoogleCloudStorageBuilder;
@@ -11,7 +10,6 @@ use tokio::sync::{RwLock, Semaphore};
 use tonic::transport::Channel;
 use uuid::Uuid;
 
-use crate::chunk_cache::SharedChunkCache;
 use crate::constants::GRPC_MAX_MESSAGE_SIZE;
 use crate::storage::{compute_crc32c, ChunkStorage};
 
@@ -26,8 +24,6 @@ pub type PeerClient = P2pTransferClient<Channel>;
 
 pub struct Downloader {
     storage: Arc<ChunkStorage>,
-    /// In-memory chunk cache for faster P2P streaming
-    chunk_cache: SharedChunkCache,
     /// Cache of bucket -> ObjectStore
     bucket_stores: RwLock<HashMap<String, Arc<dyn ObjectStore>>>,
     /// Optional rate limit for GCS downloads in bytes per second
@@ -37,7 +33,7 @@ pub struct Downloader {
 }
 
 impl Downloader {
-    pub fn new(storage: Arc<ChunkStorage>, chunk_cache: SharedChunkCache) -> anyhow::Result<Self> {
+    pub fn new(storage: Arc<ChunkStorage>) -> anyhow::Result<Self> {
         // Parse bandwidth limits (e.g., "10m" for 10 Mbit/s, "1g" for 1 Gbit/s)
         let gcs_bandwidth_limit_bps = std::env::var("TEST_ONLY_LIMIT_GCS_BANDWIDTH")
             .ok()
@@ -57,7 +53,6 @@ impl Downloader {
 
         Ok(Self {
             storage,
-            chunk_cache,
             bucket_stores: RwLock::new(HashMap::new()),
             gcs_bandwidth_limit_bps,
             p2p_bandwidth_limit_bps,
@@ -299,10 +294,6 @@ impl Downloader {
 
             let chunk_data = &data[offset_in_batch..chunk_end_offset];
 
-            // Compute CRC32C and cache the chunk for P2P serving
-            let crc32c = compute_crc32c(chunk_data);
-            self.chunk_cache.put(file_id, chunk_id, Bytes::copy_from_slice(chunk_data), crc32c).await;
-
             self.storage.append_chunk(file_id, chunk_data).await?;
 
             bytes_written += chunk_data.len() as u64;
@@ -389,14 +380,6 @@ impl Downloader {
                 );
                 return Ok(false);
             }
-
-            // Cache the chunk for P2P serving to downstream workers
-            self.chunk_cache.put(
-                file_id,
-                chunk_data.chunk_id,
-                Bytes::copy_from_slice(&chunk_data.data),
-                actual_crc32c,
-            ).await;
 
             // Append chunk to storage
             self.storage.append_chunk(file_id, &chunk_data.data).await?;

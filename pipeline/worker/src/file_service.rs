@@ -7,7 +7,6 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
 
-use crate::chunk_cache::SharedChunkCache;
 use crate::constants::GRPC_MAX_MESSAGE_SIZE;
 use crate::storage::{compute_crc32c, ChunkStorage};
 
@@ -32,14 +31,13 @@ pub type ChunkMetaStore = Arc<RwLock<HashMap<Uuid, ChunkMeta>>>;
 
 pub struct FileService {
     storage: Arc<ChunkStorage>,
-    chunk_cache: SharedChunkCache,
     upload_tracker: UploadTracker,
     chunk_meta: ChunkMetaStore,
 }
 
 impl FileService {
-    pub fn new(storage: Arc<ChunkStorage>, chunk_cache: SharedChunkCache, upload_tracker: UploadTracker, chunk_meta: ChunkMetaStore) -> Self {
-        Self { storage, chunk_cache, upload_tracker, chunk_meta }
+    pub fn new(storage: Arc<ChunkStorage>, upload_tracker: UploadTracker, chunk_meta: ChunkMetaStore) -> Self {
+        Self { storage, upload_tracker, chunk_meta }
     }
 
     pub fn into_server(self) -> P2pTransferServer<Self> {
@@ -64,7 +62,6 @@ impl P2pTransfer for FileService {
 
         let start_chunk = req.start_from_chunk_id;
         let storage = self.storage.clone();
-        let chunk_cache = self.chunk_cache.clone();
         let upload_tracker = self.upload_tracker.clone();
         let chunk_meta = self.chunk_meta.clone();
 
@@ -120,26 +117,18 @@ impl P2pTransfer for FileService {
                     chunk_size
                 };
 
-                // Try cache first, fall back to disk
-                let (data, crc32c) = if let Some((cached_data, cached_crc)) = chunk_cache.get(file_id, chunk_id).await {
-                    tracing::debug!("Cache hit for chunk {} of file {}", chunk_id, file_id);
-                    (cached_data.to_vec(), cached_crc)
-                } else {
-                    tracing::debug!("Cache miss for chunk {} of file {}, reading from disk", chunk_id, file_id);
-                    // Read the chunk from disk
-                    let data = match storage.read_range(file_id, offset, this_chunk_size as usize).await {
-                        Ok(d) => d,
-                        Err(e) => {
-                            tracing::error!("Failed to read chunk {} for file {}: {}", chunk_id, file_id, e);
-                            let _ = tx.send(Err(Status::internal(format!("Failed to read chunk: {}", e)))).await;
-                            return;
-                        }
-                    };
-
-                    // Compute CRC32C
-                    let crc32c = compute_crc32c(&data);
-                    (data, crc32c)
+                // Read the chunk from disk
+                let data = match storage.read_range(file_id, offset, this_chunk_size as usize).await {
+                    Ok(d) => d,
+                    Err(e) => {
+                        tracing::error!("Failed to read chunk {} for file {}: {}", chunk_id, file_id, e);
+                        let _ = tx.send(Err(Status::internal(format!("Failed to read chunk: {}", e)))).await;
+                        return;
+                    }
                 };
+
+                // Compute CRC32C
+                let crc32c = compute_crc32c(&data);
 
                 // Send chunk
                 let chunk_data = ChunkData {

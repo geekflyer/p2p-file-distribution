@@ -1,4 +1,3 @@
-mod chunk_cache;
 mod constants;
 mod coordinator_client;
 mod downloader;
@@ -35,7 +34,6 @@ fn get_disk_stats(_data_dir: &std::path::Path) -> Option<(u64, u64)> {
     }
 }
 
-use chunk_cache::{create_chunk_cache, DEFAULT_CACHE_SIZE};
 use coordinator_client::CoordinatorClient;
 use downloader::Downloader;
 use file_service::{ChunkMeta, ChunkMetaStore, FileService, UploadTracker};
@@ -175,15 +173,11 @@ async fn main() -> anyhow::Result<()> {
     // Create storage
     let storage = Arc::new(ChunkStorage::new(PathBuf::from(&data_dir)));
 
-    // Create in-memory chunk cache (for faster P2P streaming)
-    let chunk_cache = create_chunk_cache(DEFAULT_CACHE_SIZE);
-    tracing::info!("Chunk cache initialized with {} entry capacity", DEFAULT_CACHE_SIZE);
-
     // Create coordinator client
     let coordinator = CoordinatorClient::new(coordinator_url, worker_id.clone(), worker_addr.clone());
 
     // Create downloader
-    let downloader = Arc::new(Downloader::new(storage.clone(), chunk_cache.clone())?);
+    let downloader = Arc::new(Downloader::new(storage.clone())?);
 
     // Track task states
     let task_states: Arc<RwLock<HashMap<Uuid, TaskState>>> = Arc::new(RwLock::new(HashMap::new()));
@@ -201,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
     let chunk_meta: ChunkMetaStore = Arc::new(RwLock::new(HashMap::new()));
 
     // Spawn gRPC server for P2P transfers
-    let file_service = FileService::new(storage.clone(), chunk_cache.clone(), upload_tracker.clone(), chunk_meta.clone());
+    let file_service = FileService::new(storage.clone(), upload_tracker.clone(), chunk_meta.clone());
     let grpc_addr = format!("0.0.0.0:{}", grpc_port).parse()?;
     tokio::spawn(async move {
         tracing::info!("Starting gRPC server on {}", grpc_addr);
@@ -297,8 +291,6 @@ async fn main() -> anyhow::Result<()> {
                 let mut meta = chunk_meta.write().await;
                 meta.remove(file_id);
             }
-            // Remove from chunk cache
-            chunk_cache.remove_file(*file_id).await;
             // Delete data from storage
             if let Err(e) = storage.delete_file(*file_id).await {
                 tracing::warn!("Failed to delete data for purged file {}: {}", file_id, e);
