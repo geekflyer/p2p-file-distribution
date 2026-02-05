@@ -197,13 +197,12 @@ async fn stream_chunks_sendfile(
             #[cfg(target_os = "linux")]
             {
                 use nix::sys::sendfile::sendfile;
-                use std::os::fd::AsRawFd;
                 let mut sent = 0usize;
                 let mut file_offset = offset as i64;
                 while sent < size {
                     let n = sendfile(
-                        socket_clone.as_raw_fd(),
-                        data_file_clone.as_raw_fd(),
+                        &socket_clone,
+                        &data_file_clone,
                         Some(&mut file_offset),
                         size - sent,
                     )?;

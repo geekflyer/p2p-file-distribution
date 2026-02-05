@@ -356,6 +356,23 @@ COORDINATOR_IP="$COORDINATOR_IP"
 # Get own IP for worker address
 MY_IP=\$(curl -s "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip" -H "Metadata-Flavor: Google")
 
+# Format and mount local SSD for high-throughput storage
+LOCAL_SSD_MOUNT="/mnt/disks/local-ssd"
+if [ -e /dev/nvme0n1 ]; then
+    echo "Setting up local SSD..."
+    mkfs.ext4 -F /dev/nvme0n1
+    mkdir -p \$LOCAL_SSD_MOUNT
+    mount -o discard,defaults /dev/nvme0n1 \$LOCAL_SSD_MOUNT
+    chmod 755 \$LOCAL_SSD_MOUNT
+    DATA_DIR="\$LOCAL_SSD_MOUNT/data"
+    mkdir -p \$DATA_DIR
+    echo "Local SSD mounted at \$LOCAL_SSD_MOUNT"
+else
+    echo "No local SSD found, using boot disk"
+    DATA_DIR="/opt/pipeline/data"
+    mkdir -p \$DATA_DIR
+fi
+
 mkdir -p /opt/pipeline
 cd /opt/pipeline
 
@@ -383,9 +400,6 @@ else
     gsutil cp ./worker "gs://\$BUCKET/binaries/worker"
 fi
 
-# Create data directory
-mkdir -p /opt/pipeline/data
-
 # Create systemd service
 cat > /etc/systemd/system/worker.service << EOF
 [Unit]
@@ -396,10 +410,10 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/pipeline
-Environment=DATA_DIR=/opt/pipeline/data
+Environment=DATA_DIR=\$DATA_DIR
 Environment=COORDINATOR_URL=http://\$COORDINATOR_IP:8080
 Environment=WORKER_ADDR=\$MY_IP:50051
-Environment=GRPC_PORT=50051
+Environment=TCP_PORT=50051
 Environment=RUST_LOG=info
 ExecStart=/opt/pipeline/worker
 Restart=always
@@ -413,19 +427,25 @@ systemctl daemon-reload
 systemctl enable worker
 systemctl start worker
 
-echo "Worker started!"
+echo "Worker started with DATA_DIR=\$DATA_DIR"
 STARTUP_EOF
+
+    # Build local SSD flags
+    LOCAL_SSD_FLAGS=""
+    for i in $(seq 1 ${WORKER_LOCAL_SSD_COUNT:-0}); do
+        LOCAL_SSD_FLAGS="$LOCAL_SSD_FLAGS --local-ssd=interface=NVME"
+    done
 
     gcloud compute instance-templates create "$TEMPLATE_NAME" \
         --machine-type="$WORKER_MACHINE_TYPE" \
         --image-family=debian-12 \
         --image-project=debian-cloud \
-        --boot-disk-size="$WORKER_DISK_SIZE" \
-        --boot-disk-type=pd-ssd \
+        --boot-disk-size="${WORKER_BOOT_DISK_SIZE:-20GB}" \
         --scopes=storage-rw \
         --tags=pipeline-worker \
         --no-address \
-        --metadata-from-file=startup-script=/tmp/worker-startup.sh
+        --metadata-from-file=startup-script=/tmp/worker-startup.sh \
+        $LOCAL_SSD_FLAGS
 
     rm /tmp/worker-startup.sh
 

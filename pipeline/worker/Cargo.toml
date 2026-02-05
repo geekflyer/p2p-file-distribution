@@ -17,7 +17,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 object_store = { version = "0.11", features = ["gcp"] }
 urlencoding = "2"
 libc = "0.2"
-nix = { version = "0.29", features = ["fs"] }
+nix = { version = "0.29", features = ["fs", "zerocopy"] }
 crc32c = "0.6"
 dotenvy = "0.15"
 base64 = "0.22"
