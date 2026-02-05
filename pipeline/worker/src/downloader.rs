@@ -1,16 +1,14 @@
-use common::proto::p2p_transfer_client::P2pTransferClient;
-use common::proto::ChunkRequest;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::{RwLock, Semaphore};
-use tonic::transport::Channel;
 use uuid::Uuid;
 
-use crate::constants::GRPC_MAX_MESSAGE_SIZE;
 use crate::storage::{compute_crc32c, ChunkStorage};
 
 /// Number of chunks to batch per GCS request (~256MB with 64MB chunks)
@@ -18,9 +16,6 @@ const GCS_BATCH_CHUNKS: usize = 4;
 
 /// Number of parallel GCS downloads (reduced to limit memory usage)
 const GCS_PARALLEL_DOWNLOADS: usize = 4;
-
-/// Type alias for the gRPC client used for peer transfers
-pub type PeerClient = P2pTransferClient<Channel>;
 
 pub struct Downloader {
     storage: Arc<ChunkStorage>,
@@ -90,17 +85,6 @@ impl Downloader {
         }
 
         Ok(store)
-    }
-
-    /// Connect to a peer for P2P transfers
-    pub async fn connect_to_peer(peer_addr: &str) -> anyhow::Result<PeerClient> {
-        let addr = format!("http://{}", peer_addr);
-        tracing::info!("Connecting to peer at {}", addr);
-        let client = P2pTransferClient::connect(addr)
-            .await?
-            .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE);
-        Ok(client)
     }
 
     /// Download chunks from GCS in batches with parallel downloads for efficiency
@@ -266,6 +250,7 @@ impl Downloader {
     }
 
     /// Helper to write a batch to storage and report progress
+    /// Also computes and stores CRC32C per chunk for P2P serving
     async fn write_batch<F, Fut>(
         &self,
         file_id: Uuid,
@@ -294,6 +279,10 @@ impl Downloader {
 
             let chunk_data = &data[offset_in_batch..chunk_end_offset];
 
+            // Compute CRC32C and store it for P2P serving
+            let crc32c = compute_crc32c(chunk_data);
+            self.storage.store_chunk_crc32c(file_id, chunk_id, crc32c).await?;
+
             self.storage.append_chunk(file_id, chunk_data).await?;
 
             bytes_written += chunk_data.len() as u64;
@@ -312,10 +301,13 @@ impl Downloader {
         Ok(bytes_written)
     }
 
-    /// Download chunks from a peer via gRPC streaming
+    /// Download chunks from a peer via raw TCP with sendfile
+    /// Protocol:
+    /// - Request: [file_id: 16 bytes][start_chunk: 4 bytes i32 LE]
+    /// - Response per chunk: [chunk_id: 4 bytes i32 LE][crc32c: 4 bytes u32 LE][size: 4 bytes u32 LE][data]
     pub async fn download_chunks_from_peer<F, Fut>(
         &self,
-        client: &mut PeerClient,
+        peer_addr: &str,
         file_id: Uuid,
         start_from_chunk: i32,
         total_chunks: i32,
@@ -327,65 +319,91 @@ impl Downloader {
         F: Fn(i32, i32, u64, Option<u64>) -> Fut + Send + Sync,
         Fut: Future<Output = ()> + Send,
     {
-        let request = ChunkRequest {
-            file_id: file_id.to_string(),
-            start_from_chunk_id: start_from_chunk,
-        };
+        tracing::info!("Connecting to peer {} for file {}", peer_addr, file_id);
 
-        let mut stream = match client.stream_chunks(request).await {
-            Ok(response) => response.into_inner(),
+        let mut stream = match TcpStream::connect(peer_addr).await {
+            Ok(s) => s,
             Err(e) => {
-                tracing::warn!("Failed to start chunk stream from peer: {} - will retry", e);
+                tracing::warn!("Failed to connect to peer {}: {} - will retry", peer_addr, e);
                 return Ok(false);
             }
         };
+
+        // Send request: [file_id: 16 bytes][start_chunk: 4 bytes i32 LE]
+        let mut request = [0u8; 20];
+        request[0..16].copy_from_slice(file_id.as_bytes());
+        request[16..20].copy_from_slice(&start_from_chunk.to_le_bytes());
+
+        if let Err(e) = stream.write_all(&request).await {
+            tracing::warn!("Failed to send request to peer: {} - will retry", e);
+            return Ok(false);
+        }
 
         let download_start = std::time::Instant::now();
         let mut total_bytes_downloaded: u64 = 0;
         let mut last_chunk_received = start_from_chunk - 1;
 
+        // Read chunks
         loop {
-            let chunk_data = match stream.message().await {
-                Ok(Some(data)) => data,
-                Ok(None) => break, // Stream ended normally
+            // Read header: [chunk_id: 4][crc32c: 4][size: 4] = 12 bytes
+            let mut header = [0u8; 12];
+            match stream.read_exact(&mut header).await {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    // Stream ended - check if we got all chunks
+                    break;
+                }
                 Err(e) => {
-                    tracing::warn!("Peer stream error: {} - will retry", e);
+                    tracing::warn!("Failed to read header from peer: {} - will retry", e);
                     return Ok(false);
                 }
-            };
-
-            // Verify CRC32C
-            let actual_crc32c = compute_crc32c(&chunk_data.data);
-            if actual_crc32c != chunk_data.crc32c {
-                tracing::warn!(
-                    "CRC32C mismatch for chunk {}: expected {:08x}, got {:08x} - will retry",
-                    chunk_data.chunk_id, chunk_data.crc32c, actual_crc32c
-                );
-                return Ok(false);
             }
 
-            // Calculate the correct chunk size for this chunk
-            let expected_chunk_size = if chunk_data.chunk_id == total_chunks - 1 {
-                // Last chunk may be smaller
+            let chunk_id = i32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+            let crc32c = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+            let size = u32::from_le_bytes([header[8], header[9], header[10], header[11]]);
+
+            // Validate size
+            let expected_chunk_size = if chunk_id == total_chunks - 1 {
                 let remainder = total_size % chunk_size;
                 if remainder == 0 { chunk_size } else { remainder }
             } else {
                 chunk_size
             };
 
-            if chunk_data.data.len() as u64 != expected_chunk_size {
+            if size as u64 != expected_chunk_size {
                 tracing::warn!(
                     "Chunk {} size mismatch: expected {}, got {}",
-                    chunk_data.chunk_id, expected_chunk_size, chunk_data.data.len()
+                    chunk_id, expected_chunk_size, size
                 );
                 return Ok(false);
             }
 
-            // Append chunk to storage
-            self.storage.append_chunk(file_id, &chunk_data.data).await?;
+            // Read chunk data
+            let mut data = vec![0u8; size as usize];
+            if let Err(e) = stream.read_exact(&mut data).await {
+                tracing::warn!("Failed to read chunk data from peer: {} - will retry", e);
+                return Ok(false);
+            }
 
-            total_bytes_downloaded += chunk_data.data.len() as u64;
-            last_chunk_received = chunk_data.chunk_id;
+            // Verify CRC32C
+            let actual_crc32c = compute_crc32c(&data);
+            if actual_crc32c != crc32c {
+                tracing::warn!(
+                    "CRC32C mismatch for chunk {}: expected {:08x}, got {:08x} - will retry",
+                    chunk_id, crc32c, actual_crc32c
+                );
+                return Ok(false);
+            }
+
+            // Store CRC32C for downstream P2P serving
+            self.storage.store_chunk_crc32c(file_id, chunk_id, actual_crc32c).await?;
+
+            // Append chunk to storage
+            self.storage.append_chunk(file_id, &data).await?;
+
+            total_bytes_downloaded += data.len() as u64;
+            last_chunk_received = chunk_id;
 
             // Rate limiting
             if let Some(rate_bps) = self.p2p_bandwidth_limit_bps {
@@ -404,7 +422,7 @@ impl Downloader {
                 None
             };
 
-            on_progress(chunk_data.chunk_id, total_chunks, total_bytes_downloaded, throughput).await;
+            on_progress(chunk_id, total_chunks, total_bytes_downloaded, throughput).await;
 
             // Check if we've received all chunks
             if last_chunk_received >= total_chunks - 1 {

@@ -1,4 +1,5 @@
 use std::io::SeekFrom;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -6,6 +7,14 @@ use uuid::Uuid;
 
 pub struct ChunkStorage {
     data_dir: PathBuf,
+}
+
+/// Metadata about a chunk for P2P serving
+#[derive(Debug, Clone, Copy)]
+pub struct ChunkInfo {
+    pub offset: u64,
+    pub size: u32,
+    pub crc32c: u32,
 }
 
 impl ChunkStorage {
@@ -26,6 +35,11 @@ impl ChunkStorage {
     /// Output file path (final)
     fn output_path(&self, file_id: Uuid) -> PathBuf {
         self.file_dir(file_id).join("output.bin")
+    }
+
+    /// CRC32C sidecar file path (stores CRC32C per chunk as array of u32 LE)
+    fn crc32c_path(&self, file_id: Uuid) -> PathBuf {
+        self.file_dir(file_id).join("crc32c.bin")
     }
 
     /// Ensure file directory exists
@@ -119,29 +133,6 @@ impl ChunkStorage {
         (file_size / chunk_size) as i32 - 1
     }
 
-    /// Read range from output file (for P2P serving)
-    pub async fn read_range(&self, file_id: Uuid, offset: u64, length: usize) -> anyhow::Result<Vec<u8>> {
-        // Try final file first, then partial
-        let final_path = self.output_path(file_id);
-        let partial_path = self.output_partial_path(file_id);
-
-        let path = if fs::try_exists(&final_path).await.unwrap_or(false) {
-            final_path
-        } else if fs::try_exists(&partial_path).await.unwrap_or(false) {
-            partial_path
-        } else {
-            anyhow::bail!("No output file exists for {}", file_id);
-        };
-
-        let mut file = File::open(&path).await?;
-        file.seek(SeekFrom::Start(offset)).await?;
-
-        let mut buffer = vec![0u8; length];
-        file.read_exact(&mut buffer).await?;
-
-        Ok(buffer)
-    }
-
     /// Finalize (rename partial to final)
     pub async fn finalize(&self, file_id: Uuid) -> anyhow::Result<()> {
         let partial_path = self.output_partial_path(file_id);
@@ -219,6 +210,81 @@ impl ChunkStorage {
             tracing::info!("Deleted data for {}", file_id);
         }
         Ok(())
+    }
+
+    /// Store CRC32C for a chunk (appends to sidecar file)
+    pub async fn store_chunk_crc32c(&self, file_id: Uuid, chunk_id: i32, crc32c: u32) -> anyhow::Result<()> {
+        let crc_path = self.crc32c_path(file_id);
+
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .open(&crc_path)
+            .await?;
+
+        // Seek to position for this chunk (each entry is 4 bytes)
+        let offset = (chunk_id as u64) * 4;
+        file.seek(SeekFrom::Start(offset)).await?;
+        file.write_all(&crc32c.to_le_bytes()).await?;
+        file.sync_data().await?;
+
+        Ok(())
+    }
+
+    /// Get CRC32C for a chunk (reads from sidecar file)
+    pub async fn get_chunk_crc32c(&self, file_id: Uuid, chunk_id: i32) -> anyhow::Result<u32> {
+        let crc_path = self.crc32c_path(file_id);
+
+        let mut file = File::open(&crc_path).await?;
+        let offset = (chunk_id as u64) * 4;
+        file.seek(SeekFrom::Start(offset)).await?;
+
+        let mut buf = [0u8; 4];
+        file.read_exact(&mut buf).await?;
+
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    /// Get chunk info for P2P serving (offset, size, crc32c)
+    pub async fn get_chunk_info(
+        &self,
+        file_id: Uuid,
+        chunk_id: i32,
+        chunk_size: u64,
+        total_size: u64,
+        total_chunks: i32,
+    ) -> anyhow::Result<ChunkInfo> {
+        let offset = chunk_id as u64 * chunk_size;
+        let size = if chunk_id == total_chunks - 1 {
+            // Last chunk may be smaller
+            let remainder = total_size % chunk_size;
+            if remainder == 0 { chunk_size as u32 } else { remainder as u32 }
+        } else {
+            chunk_size as u32
+        };
+
+        let crc32c = self.get_chunk_crc32c(file_id, chunk_id).await?;
+
+        Ok(ChunkInfo { offset, size, crc32c })
+    }
+
+    /// Open file and return raw fd for sendfile (blocking operation, call from spawn_blocking)
+    pub fn open_file_for_sendfile(&self, file_id: Uuid) -> anyhow::Result<(std::fs::File, i32)> {
+        // Try final file first, then partial
+        let final_path = self.output_path(file_id);
+        let partial_path = self.output_partial_path(file_id);
+
+        let path = if final_path.exists() {
+            final_path
+        } else if partial_path.exists() {
+            partial_path
+        } else {
+            anyhow::bail!("No output file exists for {}", file_id);
+        };
+
+        let file = std::fs::File::open(&path)?;
+        let fd = file.as_raw_fd();
+        Ok((file, fd))
     }
 }
 

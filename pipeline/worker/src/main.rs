@@ -1,8 +1,7 @@
-mod constants;
 mod coordinator_client;
 mod downloader;
-mod file_service;
 mod storage;
+mod tcp_server;
 
 use chrono::Utc;
 use common::{DistributionTask, TaskProgress, Upstream};
@@ -12,7 +11,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
-use tonic::transport::Server;
 use uuid::Uuid;
 
 /// Get disk stats for the root filesystem (total bytes, used bytes)
@@ -36,8 +34,8 @@ fn get_disk_stats(_data_dir: &std::path::Path) -> Option<(u64, u64)> {
 
 use coordinator_client::CoordinatorClient;
 use downloader::Downloader;
-use file_service::{ChunkMeta, ChunkMetaStore, FileService, UploadTracker};
 use storage::ChunkStorage;
+use tcp_server::{ChunkMeta, ChunkMetaStore, UploadTracker};
 
 /// Rolling window throughput tracker
 /// Tracks cumulative bytes over time and calculates throughput from the window
@@ -153,12 +151,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     // Get configuration from environment
-    let grpc_port = std::env::var("GRPC_PORT")
+    let tcp_port = std::env::var("TCP_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(50051u16);
     let worker_addr = std::env::var("WORKER_ADDR")
-        .unwrap_or_else(|_| format!("localhost:{}", grpc_port));
+        .unwrap_or_else(|_| format!("localhost:{}", tcp_port));
     let worker_id = std::env::var("WORKER_ID")
         .unwrap_or_else(|_| worker_addr.clone());
     let coordinator_url =
@@ -194,17 +192,19 @@ async fn main() -> anyhow::Result<()> {
     // Track chunk metadata for P2P serving
     let chunk_meta: ChunkMetaStore = Arc::new(RwLock::new(HashMap::new()));
 
-    // Spawn gRPC server for P2P transfers
-    let file_service = FileService::new(storage.clone(), upload_tracker.clone(), chunk_meta.clone());
-    let grpc_addr = format!("0.0.0.0:{}", grpc_port).parse()?;
+    // Spawn TCP server for P2P transfers (uses sendfile for zero-copy)
+    let tcp_addr = format!("0.0.0.0:{}", tcp_port).parse()?;
+    let tcp_storage = storage.clone();
+    let tcp_chunk_meta = chunk_meta.clone();
+    let tcp_upload_tracker = upload_tracker.clone();
     tokio::spawn(async move {
-        tracing::info!("Starting gRPC server on {}", grpc_addr);
-        if let Err(e) = Server::builder()
-            .add_service(file_service.into_server())
-            .serve(grpc_addr)
-            .await
-        {
-            tracing::error!("gRPC server error: {}", e);
+        if let Err(e) = tcp_server::start_tcp_server(
+            tcp_addr,
+            tcp_storage,
+            tcp_chunk_meta,
+            tcp_upload_tracker,
+        ).await {
+            tracing::error!("TCP server error: {}", e);
         }
     });
 
@@ -461,28 +461,17 @@ async fn run_download(
                 .await
         }
         Upstream::Peer { worker_address, .. } => {
-            match Downloader::connect_to_peer(worker_address).await {
-                Ok(mut client) => {
-                    downloader
-                        .download_chunks_from_peer(
-                            &mut client,
-                            file_id,
-                            start_from_chunk,
-                            task.total_chunks,
-                            task.chunk_size,
-                            task.total_file_size_bytes,
-                            progress_callback,
-                        )
-                        .await
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to connect to peer {}: {}", worker_address, e);
-                    // Remove from downloading set so it can retry
-                    let mut downloading = downloading_files.write().await;
-                    downloading.remove(&file_id);
-                    return;
-                }
-            }
+            downloader
+                .download_chunks_from_peer(
+                    worker_address,
+                    file_id,
+                    start_from_chunk,
+                    task.total_chunks,
+                    task.chunk_size,
+                    task.total_file_size_bytes,
+                    progress_callback,
+                )
+                .await
         }
     };
 
