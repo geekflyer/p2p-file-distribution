@@ -1,29 +1,28 @@
 # File Distribution System
 
-Two implementations of large file distribution across server fleets:
+Large file distribution across server fleets using chain topology with P2P propagation.
 
 ## Directory Structure
 
 ```
 pipeline/           # Chain topology implementation
   coordinator/      # HTTP + job management
-  server/           # Downloads from GCS or upstream peer
-  common/           # Types + proto
+  worker/           # Downloads from GCS or upstream peer via raw TCP
+  common/           # Shared types
   scripts/          # start-local.sh, gcp-deploy.sh
 
-mesh/               # P2P mesh topology implementation
-  coordinator/      # gRPC scheduler + HTTP admin
-  server/           # Pull-based work loop
-  common/           # Types + proto
-  scripts/          # (mesh-specific scripts)
-
 scripts/            # Shared scripts (test data generation)
-data/               # Local storage for both
+data/               # Local storage
 ```
 
-## Pipeline (Chain Topology)
+## Pipeline Architecture
 
-Chain of servers where Server N downloads from Server N-1 (or GCS for first server).
+Chain of workers where Worker N downloads from Worker N-1 (or GCS for first worker).
+
+- **Coordinator**: Assigns work, tracks progress, serves admin UI
+- **Worker**: Downloads chunks from GCS or peers, serves chunks to downstream peers
+- **P2P Transfer**: Raw TCP with Linux `sendfile()` for zero-copy transfer
+- **Chunk verification**: CRC32C checksums stored per chunk
 
 ```bash
 cd pipeline
@@ -32,33 +31,17 @@ cargo build --release
 ```
 
 - Coordinator: http://localhost:8080
-- Simple chain assignment based on server order
+- Workers connect to coordinator and receive task assignments
+- First worker downloads from GCS, subsequent workers download from upstream peer
 
-## Mesh (P2P Topology)
+## Worker Environment Variables
 
-Dynamic shard distribution using rarest-first scheduling.
-
-```bash
-cd mesh
-cargo build --release
-# Start coordinator (port 8081 for HTTP, 50050 for gRPC)
-./target/release/coordinator
-# Start servers
-COORDINATOR_URL=http://localhost:50050 ./target/release/server
-```
-
-- Coordinator HTTP: http://localhost:8081
-- Coordinator gRPC: localhost:50050
-- Rarest-shard-first scheduling, max 1 GCS download globally
-
-## Shared
-
-- **scripts/generate-test-data.sh** - Generate test shards
-- **scripts/upload-test-data.sh** - Upload to GCS/emulator
-- **data/gcs/** - Fake GCS storage
-
-## Environment Variables
-
+- `COORDINATOR_URL` - Coordinator HTTP URL (e.g., http://localhost:8080)
+- `WORKER_ADDR` - Worker's address for P2P (e.g., 10.0.0.1:50051)
+- `TCP_PORT` - Port for P2P TCP server (default: 50051)
+- `DATA_DIR` - Directory for storing downloaded files
+- `GCS_PARALLEL_DOWNLOADS` - Number of parallel GCS downloads (default: 4)
+- `GCS_BATCH_CHUNKS` - Chunks per GCS request (default: 1, each chunk is 64MB)
 - `STORAGE_EMULATOR_HOST` - GCS emulator URL (e.g., http://localhost:4443)
 - `TEST_ONLY_LIMIT_GCS_BANDWIDTH` - e.g., "10m" for 10 Mbit/s
 - `TEST_ONLY_LIMIT_P2P_BANDWIDTH` - e.g., "5m" for 5 Mbit/s
@@ -85,7 +68,25 @@ When deploying to GCP with code changes, always cross-compile for Linux first:
 cd pipeline
 cross build --release --target x86_64-unknown-linux-gnu
 gsutil cp target/x86_64-unknown-linux-gnu/release/coordinator gs://pipeline-test-christian/binaries/
-gsutil cp target/x86_64-unknown-linux-gnu/release/server gs://pipeline-test-christian/binaries/
+gsutil cp target/x86_64-unknown-linux-gnu/release/worker gs://pipeline-test-christian/binaries/
 ```
 
 Then create/update the VMs. The binaries in GCS must be Linux x86_64, not macOS.
+
+### Instance Configuration
+
+- **Coordinator**: `e2-highcpu-2`, 20GB boot disk
+- **Workers**: `n2-standard-8` (32GB RAM), 375GB local NVMe SSD for data
+  - Local SSD mounted at `/mnt/disks/local-ssd`
+  - Data stored at `/mnt/disks/local-ssd/data`
+  - Note: Local SSD data is ephemeral (lost on VM stop/delete)
+
+### Deployment Script
+
+```bash
+cd pipeline
+NUM_WORKERS=10 ./scripts/gcp-deploy.sh deploy
+./scripts/gcp-deploy.sh status
+./scripts/gcp-deploy.sh tunnel  # SSH tunnel to coordinator UI
+./scripts/gcp-deploy.sh cleanup
+```
